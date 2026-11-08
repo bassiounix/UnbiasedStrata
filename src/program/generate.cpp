@@ -5254,6 +5254,36 @@ int main(int argc, char** argv) {
                      (unsigned long long) native_head.weight_bytes(),
                      std::chrono::duration<double>(std::chrono::steady_clock::now() - head_t0).count());
     }
+    // STRATA_PREFILL_IN_HEAD=1 (opt-in, small cards): the prompt path's buffers are carved inside the native head's
+    // VRAM, whatever does not fit is allocated beside it, and the head's blocks are written back from a pinned copy
+    // after every prompt read that ran over them - at the same address, so the verify graphs stay valid.  Unlike
+    // --prefill-head-alias nothing is freed or reallocated, and it needs neither --mtp nor a lendable expert cache.
+    bool head_in_place = false;
+    int64_t head_chunks_seen = 0;
+    if (const char* e = std::getenv("STRATA_PREFILL_IN_HEAD"); e != nullptr && e[0] == '1') {
+        const char* why = !o.serve ? "it needs --serve"
+                        : multi_gpu ? "it supports one GPU only"
+                        : !native_head.loaded() ? "it needs the native output head (--native)"
+                        : o.prefill_head_alias ? "it replaces --prefill-head-alias"
+                        : o.batch > 0 ? "it does not support --batch"
+                        : o.pipeline_windows > 0 ? "it does not support --pipeline-windows"
+                        : o.short_read > 0 ? "it needs --short-read 0"
+                        : !o.mtp.empty() ? "it does not support --mtp (the draft head copies the head's rows)"
+                        : o.prefill_chunk <= 0 ? "it needs --prefill CHUNK"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_HEAD is unavailable: %s\n", why);
+            return 2;
+        }
+        if (!native_head.keep_host_copy(err)) {
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_HEAD: %s\n", err.c_str());
+            return 1;
+        }
+        head_in_place = true;
+        std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_HEAD=1: the prompt path's buffers share the output "
+                             "head's %llu MiB of VRAM; the head is written back from RAM after each prompt read\n",
+                     (unsigned long long) (native_head.weight_bytes() >> 20));
+    }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
     float* d_logits = nullptr;
@@ -8216,8 +8246,12 @@ int main(int argc, char** argv) {
             }
             if (multi_gpu) sp.set_stage(0, split_at[0], &stages[0]->sp);
             if (share_pool) sp.set_cpu_pool(&pool);
-            if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err, borrow, borrow_bytes,
-                         o.prefill_head_alias))
+            // STRATA_PREFILL_IN_HEAD: no cache loan, so the head's VRAM is the loan (hybrid: the rest is the path's own)
+            const bool in_head = head_in_place && borrow == nullptr;
+            if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err,
+                         in_head ? native_head.loan() : borrow,
+                         in_head ? (native_head.weight_bytes() & ~(uint64_t) 255) : borrow_bytes,
+                         o.prefill_head_alias || in_head))
                 return err.find("do not fit") != std::string::npos ? 2 : 1;
             return 0;
         };
@@ -8229,7 +8263,8 @@ int main(int argc, char** argv) {
             const int64_t kHeadroom = 512ll << 20;
             auto own_fits = [&](int64_t c, int& dev_out, int64_t& need_out, int64_t& free_out) -> bool {
                 for (size_t i = 0; i <= stages.size(); ++i) {
-                    const bool loan = i == 0 ? borrow != nullptr : (i < pf_parts.size() && pf_parts[i].first >= 0);
+                    const bool loan = i == 0 ? (borrow != nullptr || head_in_place)
+                                             : (i < pf_parts.size() && pf_parts[i].first >= 0);
                     if (loan) continue;
                     const int dev = i == 0 ? -1 : stages[i - 1]->dev;
                     const strata::core::OnDevice on(dev);
@@ -8298,6 +8333,15 @@ int main(int argc, char** argv) {
                                      "off (setup: --vision no), close other programs using the GPU, use a shorter "
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
+        }
+        if (head_in_place) {   // the init may have written its buffers over the head: back before anything reads it
+            if (!native_head.restore(err)) {
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: %s\n", err.c_str());
+                return 1;
+            }
+            head_chunks_seen = sp.stats().chunks;
+            std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: %lld-token prompt chunks in the head's VRAM\n",
+                         (long long) o.prefill_chunk);
         }
         if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
@@ -13454,6 +13498,16 @@ int main(int argc, char** argv) {
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
+            }
+            if (head_in_place && sp.stats().chunks != head_chunks_seen) {   // a prompt read ran over the head's VRAM
+                const auto head_t0 = Clock::now();
+                if (!native_head.restore(err)) {
+                    std::printf("ERR STRATA_PREFILL_IN_HEAD: %s\n", err.c_str());
+                    return 1;
+                }
+                head_chunks_seen = sp.stats().chunks;
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: output head written back in %.1f ms\n",
+                             std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             if (o.prefill_head_alias) {
                 sp.reset();

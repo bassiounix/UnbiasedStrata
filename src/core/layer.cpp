@@ -717,6 +717,36 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+namespace {
+// STRATA_IDX_HOST=1 (opt-in, small-VRAM long contexts): the indexer's pooled keys (max_cells/4 rows of 128 floats per
+// QSA layer: 32 MiB a layer at 262K) and the RoPE cos/sin table (64 MiB at 262K) live in pinned, device-mapped host
+// memory instead of the session arena.  Every reader and writer goes through the same pointers (UVA), so no kernel
+// changes: the RoPE table is read a few rows at a time, the pooled keys up to the current position per token, over
+// PCIe.  The values are the same; only where they are stored moves.
+bool idx_host() {
+    static const bool on = [] {
+        const char* e = std::getenv("STRATA_IDX_HOST");
+        const bool v = e != nullptr && e[0] == '1';
+        if (v) std::fprintf(stderr, "strata: STRATA_IDX_HOST=1: the indexer's pooled keys and the RoPE table are in "
+                                    "pinned host memory (VRAM saved, read over PCIe)\n");
+        return v;
+    }();
+    return on;
+}
+template <typename T>
+T* idx_host_alloc(uint64_t count) {
+    uint8_t* h = kv_host_alloc(count * sizeof(T) + 256);
+    void* d = nullptr;
+    if (h == nullptr || cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        std::fprintf(stderr, "strata: STRATA_IDX_HOST: cannot pin %.1f MiB of RAM\n", (double) (count * sizeof(T)) / 1048576.0);
+        return nullptr;
+    }
+    g_kv_host_bytes += count * sizeof(T) + 256;
+    return (T*) d;
+}
+}  // namespace
+
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells) {
     const QsaShapes s = qsa_shapes(g);
     const KvPlan p = kv_plan(s, max_cells, ring_cells);
@@ -728,9 +758,9 @@ uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_ro
     if (p.mode == 1) n += strata::kernels::kv_stream_map_bytes(p.slots) + 6 * 16;   // the residency map
     n += (uint64_t) (s.idx_block - 1) * s.idx_dim * 4;                         // tail
     n += (uint64_t) s.idx_dim * 4;                                             // dead
-    n += (uint64_t) p.pooled_rows * s.idx_dim * 4;                             // pooled
+    if (!idx_host()) n += (uint64_t) p.pooled_rows * s.idx_dim * 4;            // pooled (STRATA_IDX_HOST: in RAM)
     n += 16;                                                                   // block_pos
-    if (with_rope) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;          // cos + sin tables
+    if (with_rope && !idx_host()) n += (uint64_t) max_cells * (s.n_rot / 2) * 4 * 2;   // cos + sin tables
     n += strata::kernels::qsa_step_bytes() + 16;                               // counts and aligned attention status
     n += (uint64_t) s.n_head * 4;                                              // pos_dev
     return align_up16(n) + 256;
@@ -826,11 +856,20 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.idx_tail = c.take<float>((uint64_t) (s.idx_block - 1) * s.idx_dim);
     st.idx_dead = c.take<float>((uint64_t) s.idx_dim);
     st.idx_pooled_rows = p.pooled_rows;
-    st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    if (idx_host()) {
+        st.idx_pooled = idx_host_alloc<float>((uint64_t) p.pooled_rows * s.idx_dim);
+        if (st.idx_pooled == nullptr) return 0;
+    } else {
+        st.idx_pooled = c.take<float>((uint64_t) p.pooled_rows * s.idx_dim);
+    }
     st.idx_block_pos = c.take<int32_t>(1);
     if (share_rope != nullptr) {
         st.cos_tab = share_rope->cos_tab;
         st.sin_tab = share_rope->sin_tab;
+    } else if (idx_host()) {
+        st.cos_tab = idx_host_alloc<float>((uint64_t) max_cells * (s.n_rot / 2));
+        st.sin_tab = idx_host_alloc<float>((uint64_t) max_cells * (s.n_rot / 2));
+        if (st.cos_tab == nullptr || st.sin_tab == nullptr) return 0;
     } else {
         st.cos_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));
         st.sin_tab = c.take<float>((uint64_t) max_cells * (s.n_rot / 2));

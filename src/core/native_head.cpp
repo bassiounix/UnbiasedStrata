@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <string_view>
 
 namespace strata::core {
 
@@ -20,8 +21,38 @@ void NativeHead::unload() {
     if (weights_) strata::kernels::native_q6_k_unpack(weights_);
     if (scratch_) cudaFree(scratch_);
     if (weights_) cudaFree(weights_);
+    if (host_copy_) cudaFreeHost(host_copy_);
     scratch_ = nullptr;
     weights_ = nullptr;
+    host_copy_ = nullptr;
+}
+
+bool NativeHead::keep_host_copy(std::string_view err) {
+    if (!loaded()) { err = "native head: keep_host_copy before load"; return false; }
+    if (host_copy_) return true;
+    if (cudaHostAlloc(&host_copy_, bytes_, cudaHostAllocDefault) != cudaSuccess) {
+        (void) cudaGetLastError();
+        host_copy_ = nullptr;
+        err = "native head: cannot pin " + std::to_string(bytes_ >> 20) + " MiB of RAM for the head's copy";
+        return false;
+    }
+    if (const cudaError_t e = cudaMemcpy(host_copy_, weights_, bytes_, cudaMemcpyDeviceToHost); e != cudaSuccess) {
+        err = std::string("native head: host copy: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
+}
+
+bool NativeHead::restore(std::string_view err) {
+    if (!loaded() || !host_copy_) { err = "native head: restore without a host copy"; return false; }
+    // everything that may still write the loaned VRAM (the prompt path's streams) is done first
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpy(weights_, host_copy_, bytes_, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) {
+        err = std::string("native head: restore: ") + cudaGetErrorString(e);
+        return false;
+    }
+    return true;
 }
 
 bool NativeHead::load(const std::vector<std::string>& shards, int64_t n_in, int64_t n_out, std::string& err) {

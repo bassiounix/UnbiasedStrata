@@ -31,9 +31,18 @@ public:
     int device() const { return device_; }
     /// Bytes of one vocabulary row.
     size_t row_bytes() const { return n_out_ > 0 ? (size_t) (bytes_ / (uint64_t) n_out_) : 0; }
+    /// STRATA_PREFILL_IN_HEAD: the prompt path's buffers are carved inside the weights' VRAM (the head is only read
+    /// while tokens are generated).  `keep_host_copy` copies the uploaded blocks, exactly as they are in VRAM, to
+    /// pinned RAM once; `restore` writes them back at the same address (the captured verify graphs keep it) after a
+    /// prompt was read over them.  Device-synchronous.
+    bool keep_host_copy(std::string& err);
+    bool restore(std::string& err);
+    /// Writable view of the weights' VRAM for that loan (null when not loaded).
+    void* loan() const { return weights_; }
 
 private:
     void* weights_ = nullptr;
+    void* host_copy_ = nullptr;
     void* scratch_ = nullptr;
     uint64_t bytes_ = 0;
     int n_in_ = 0, n_out_ = 0;
