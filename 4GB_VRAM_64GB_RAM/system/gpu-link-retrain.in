@@ -1,0 +1,17 @@
+#!/bin/bash
+# gpu-link-retrain - retrain the NVIDIA GPU's PCIe port (@PORT@, GPU @GPU@) at full speed.
+# Installed root-owned in /usr/local/sbin by `install.sh --system`, and allowed without a password through
+# /etc/sudoers.d/gpu-link-retrain, so strata-agent can fix a link the NVIDIA driver left stuck at Gen 1.
+# Takes no arguments, reads no configuration, does nothing else.
+set -u
+PORT=@PORT@
+GPU=@GPU@
+for c in /sys/class/thermal/cooling_device*; do
+    if [ "$(cat "$c/type" 2>/dev/null)" = "PCIe_Port_Link_Speed_$PORT" ]; then
+        timeout 10 sh -c "echo 0 > $c/cur_state" 2>/dev/null
+        echo "gpu-link-retrain: retrained $PORT (link now $(cat /sys/bus/pci/devices/$GPU/current_link_speed))"
+        exit 0
+    fi
+done
+echo "gpu-link-retrain: no PCIe link-speed cooling device for $PORT" >&2
+exit 1

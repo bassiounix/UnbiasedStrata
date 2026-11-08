@@ -1,0 +1,142 @@
+#!/usr/bin/env bash
+# gpu-mode - choose who owns the NVIDIA GPU from the next boot on: the host (NVIDIA driver) or VMs (vfio-pci).
+#
+#   gpu-mode status              this boot, the next boot, driver, PCIe link, power cap, GNOME, battery
+#   gpu-mode host                next boot: the NVIDIA driver takes the GPU at boot (full speed, HDMI works)
+#   gpu-mode vm                  next boot: vfio-pci claims the GPU at boot, for passing it to a VM
+#   gpu-mode host|vm --dry-run   show the edits without writing anything
+#   gpu-mode retrain             the PCIe link is stuck at Gen 1 under load: retrain the GPU's port at full speed
+#
+# Fedora (BLS boot entries, grubby, /etc/kernel/cmdline).  Only the two vfio boot arguments move:
+#   rd.driver.pre=vfio-pci  vfio-pci.ids=<the GPU's functions>
+# They are edited in all three places Fedora reads them from:
+#   /etc/kernel/cmdline        (copied into every kernel installed later)
+#   /etc/default/grub          (GRUB_CMDLINE_LINUX, used by grub2-mkconfig)
+#   /boot/loader/entries/*     (the installed kernels, through grubby)
+# The udev rule that tells GNOME (mutter) to ignore NVIDIA GPUs also moves: it keeps the desktop off the GPU so it can
+# be passed to a VM (vm mode), but it also leaves a port wired to the NVIDIA GPU (HDMI on many laptops) dark - host
+# mode renames it to *.gpu-mode-off.
+# Everything else a VFIO setup adds (intel_iommu=on iommu=pt, nvidia-drm.modeset=1, the vfio drivers in the initramfs,
+# Looking Glass / kvmfr) stays as it is in both modes, so no initramfs rebuild is needed.  Reboot after switching.
+#
+# The GPU is detected (the first NVIDIA VGA controller and every function in its slot); ~/.config/gpu-mode.conf
+# (written by install.sh) can pin it:   GPU=0000:01:00.0   VFIO_IDS=10de:25a0,10de:2291
+
+set -euo pipefail
+
+CONF=${GPU_MODE_CONF:-$HOME/.config/gpu-mode.conf}
+[[ $EUID -eq 0 && -n ${SUDO_USER:-} ]] && CONF=$(getent passwd "$SUDO_USER" | cut -d: -f6)/.config/gpu-mode.conf
+GPU=""; VFIO_IDS=""
+# shellcheck disable=SC1090
+[[ -r $CONF ]] && source "$CONF"
+if [[ -z $GPU ]]; then
+    GPU=$(lspci -Dn -d 10de::0300 2>/dev/null | awk 'NR == 1 { print $1 }')
+    [[ -n $GPU ]] || { echo "gpu-mode: no NVIDIA VGA controller found (set GPU= in $CONF)" >&2; exit 1; }
+fi
+if [[ -z $VFIO_IDS ]]; then   # every function of the GPU's slot (the GPU and its HDMI audio): passthrough needs them all
+    VFIO_IDS=$(lspci -Dn -s "${GPU%.*}" | awk '{ print $3 }' | paste -sd, -)
+fi
+
+VFIO_ARGS="rd.driver.pre=vfio-pci vfio-pci.ids=$VFIO_IDS"
+KCMD=/etc/kernel/cmdline
+GRUBDEF=/etc/default/grub
+RULE=/etc/udev/rules.d/61-mutter-ignore-nvidia.rules
+RULE_OFF=$RULE.gpu-mode-off
+RULE_TEXT='ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", SUBSYSTEMS=="pci", ATTRS{vendor}=="0x10de", TAG+="mutter-device-ignore"'
+HELPER=/usr/local/sbin/gpu-link-retrain
+
+strip_args() {   # the argument string without the vfio arguments, single-spaced
+    local s=" $1 " a
+    for a in $VFIO_ARGS; do s="${s// "$a" / }"; done
+    echo $s
+}
+add_args() { echo "$(strip_args "$1") $VFIO_ARGS"; }
+
+mode_of() { [[ " $1 " == *" vfio-pci.ids=$VFIO_IDS "* ]] && echo vm || echo host; }
+
+status() {
+    echo "GPU:        $GPU ($VFIO_IDS)"
+    echo "this boot:  $(mode_of "$(cat /proc/cmdline)")"
+    echo "next boot:  $(mode_of "$(cat "$KCMD")") (from $KCMD)"
+    local drv=none
+    [[ -e /sys/bus/pci/devices/$GPU/driver ]] && drv=$(basename "$(readlink /sys/bus/pci/devices/$GPU/driver)")
+    echo "GPU driver: $drv"
+    echo "PCIe link:  $(cat /sys/bus/pci/devices/$GPU/current_link_speed) x$(cat /sys/bus/pci/devices/$GPU/current_link_width) (card max $(cat /sys/bus/pci/devices/$GPU/max_link_speed))"
+    if [[ $drv == nvidia ]] && command -v nvidia-smi >/dev/null; then
+        echo "NVIDIA:     $(nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv,noheader \
+            | awk -F', ' '{print "gen " $1 " now, gen " $2 " max (idle shows gen 1; under load it should reach the max)"}')"
+        echo "power cap:  $(nvidia-smi --query-gpu=enforced.power.limit,power.default_limit --format=csv,noheader | sed 's/, / of /')"
+    fi
+    if [[ -e $RULE ]]; then echo "GNOME:      ignores the NVIDIA GPU (ports wired to it stay dark) - $RULE"
+    else echo "GNOME:      may use the NVIDIA GPU (HDMI works after the next login/boot)"; fi
+    local ac
+    ac=$(cat /sys/class/power_supply/ADP*/online /sys/class/power_supply/AC*/online 2>/dev/null | head -1 || true)
+    [[ $ac == 0 ]] && echo "WARNING:    on battery - the firmware cuts the GPU's power and PCIe speed; plug in the charger"
+    return 0
+}
+
+switch() {
+    local want=$1 dry=$2 edit
+    if [[ $want == host ]]; then edit=strip_args; else edit=add_args; fi
+    local k_old k_new g_old g_new
+    k_old=$(cat "$KCMD")
+    k_new=$($edit "$k_old")
+    g_old=$(sed -n 's/^GRUB_CMDLINE_LINUX="\(.*\)"$/\1/p' "$GRUBDEF")
+    [[ -n $g_old ]] || { echo "gpu-mode: no GRUB_CMDLINE_LINUX=\"...\" line in $GRUBDEF" >&2; exit 1; }
+    g_new=$($edit "$g_old")
+    if [[ $dry == 1 ]]; then
+        echo "$KCMD would become:";      echo "  $k_new"
+        echo "$GRUBDEF GRUB_CMDLINE_LINUX would become:"; echo "  $g_new"
+        if [[ $want == host ]]; then echo "grubby --update-kernel=ALL --remove-args=\"$VFIO_ARGS\""
+        else echo "grubby --update-kernel=ALL --remove-args=\"$VFIO_ARGS\" && grubby --update-kernel=ALL --args=\"$VFIO_ARGS\""; fi
+        if [[ $want == host ]]; then echo "udev rule: $RULE -> $RULE_OFF (GNOME may use the NVIDIA GPU: HDMI works)"
+        else echo "udev rule: restore $RULE (GNOME ignores the NVIDIA GPU, so it can go to a VM)"; fi
+        return
+    fi
+    [[ $EUID -eq 0 ]] || exec sudo "$0" "$want"
+    local stamp; stamp=$(date +%Y%m%d-%H%M%S)
+    cp -a "$KCMD" "$KCMD.gpu-mode-$stamp"
+    cp -a "$GRUBDEF" "$GRUBDEF.gpu-mode-$stamp"
+    printf '%s\n' "$k_new" > "$KCMD"
+    sed -i "s|^GRUB_CMDLINE_LINUX=\".*\"\$|GRUB_CMDLINE_LINUX=\"$g_new\"|" "$GRUBDEF"
+    grubby --update-kernel=ALL --remove-args="$VFIO_ARGS"
+    [[ $want == vm ]] && grubby --update-kernel=ALL --args="$VFIO_ARGS"
+    if [[ $want == host ]]; then
+        [[ -e $RULE ]] && mv -f "$RULE" "$RULE_OFF"
+    else
+        if [[ -e $RULE_OFF ]]; then mv -f "$RULE_OFF" "$RULE"
+        elif [[ ! -e $RULE ]]; then printf '%s\n' "$RULE_TEXT" > "$RULE"; fi
+        chmod 644 "$RULE"
+    fi
+    udevadm control --reload
+    udevadm trigger --action=change --subsystem-match=drm
+    echo "gpu-mode: next boot is '$want' (backups: *.gpu-mode-$stamp). Reboot to apply:  sudo reboot"
+    grubby --info=DEFAULT | grep '^args=' | sed 's/^/default kernel /'
+}
+
+retrain() {
+    # Seen on an RTX 3050 Ti laptop: the NVIDIA driver sometimes drops the link to Gen 1 and never raises it again,
+    # even at P0 with both ends set to target 16 GT/s (0 replays, no throttling).  Setting the port's PCIe link-speed
+    # cooling device to state 0 makes the kernel retrain the link at full speed; the driver's own switching then works
+    # again until the next drop.  The write can block or report an error; the retrain usually happens anyway.
+    # The root-owned helper (install.sh --system) does the same without a password.
+    [[ $EUID -ne 0 && -x $HELPER ]] && exec sudo "$HELPER"
+    local port cdev="" c
+    port=$(basename "$(readlink -f /sys/bus/pci/devices/$GPU/..)")
+    for c in /sys/class/thermal/cooling_device*; do
+        [[ $(cat "$c/type" 2>/dev/null) == "PCIe_Port_Link_Speed_$port" ]] && cdev=$c
+    done
+    [[ -n $cdev ]] || { echo "gpu-mode: no PCIe link-speed cooling device for port $port (kernel >= 6.13 needed)" >&2; exit 1; }
+    [[ $EUID -eq 0 ]] || exec sudo "$0" retrain
+    echo "retraining $port ($cdev)..."
+    timeout 10 sh -c "echo 0 > $cdev/cur_state" 2>/dev/null \
+        || echo "(the kernel reported an error or timed out; the retrain usually happened anyway - check it under load)"
+    echo "link now: $(cat /sys/bus/pci/devices/$GPU/current_link_speed). Idle drops it to 2.5 GT/s; it should reach full speed under load."
+}
+
+case "${1:-status}" in
+    status) status ;;
+    host|vm) switch "$1" "$([[ ${2:-} == --dry-run ]] && echo 1 || echo 0)" ;;
+    retrain) retrain ;;
+    *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

@@ -27,6 +27,7 @@ td.log
 
 # build directories and a virtualenv, if one is made for tools/
 /.venv/
+/.venv-tools/
 /build/
 /models/
 /packs/
