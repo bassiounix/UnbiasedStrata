@@ -7,7 +7,7 @@ system prompts, many turns, images. Everything here was measured on that laptop 
 
 | What | Result |
 |---|---|
-| Context window | 131,072 tokens (262,144 also works, with slower prompt reading - see [262K](#the-262k-variant)) |
+| Context window | 131,072 tokens (262,144 also fits with the same settings - see [262K](#the-262k-variant)) |
 | Cold read of a 25K-token system prompt | **460-478 tok/s** (52-54 s) |
 | Agent turn with a ~3K-token tool output | 385-394 tok/s (7.6-8.0 s) |
 | Next turn / new conversation with the same system prompt | the prompt is reused from the cache: ~25 new tokens, ~1 s |
@@ -602,16 +602,18 @@ engine command from [Step 6](#step-6---run) by hand, without `STRATA_PREFILL_IN_
 ## The 262K variant
 
 ```bash
-CONTEXT=262144 CHUNK=128 strata-agent
+CONTEXT=262144 strata-agent
 ```
 
-Measured before `STRATA_PREFILL_IN_DENSE` and page-locked experts (not re-measured with them; the lent projections
-may allow a bigger chunk than 128 at 262K). The full 262,144-token window works (checked: a passphrase hidden in the
-middle of a 25,740-token prompt was found;
-the follow-up turn reused all 25,748 cached tokens). At 262K the K/V staging pool and the indexer keys grow, so only a
-128-token chunk fits: a cold 25K read is 83 tok/s instead of 186, decode the same. Decode slows as a conversation gets
-long, because the indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured
-on the slow link). Prompt-lookup drafting fits at 262K/128 (`strata-agent --suffix-draft 3`, +7% decode).
+With the current default (`STRATA_PREFILL_IN_DENSE=1`, page-locked experts) the full 262,144-token window fits with the
+same 4096-token chunks (no step-down): 212 MiB of VRAM free at rest (220 at 128K), 2.13 GiB of pinned RAM for the K/V
+(1.06 GiB at 128K), ready in 64 s, answers coherent. Its prompt-reading speed is not measured yet: the link was stuck at
+Gen 1 during that test.
+
+Before those two changes only a 128-token chunk fit at 262K (a cold 25K read at 83 tok/s instead of 186). The window
+itself was checked then: a passphrase hidden in the middle of a 25,740-token prompt was found, and the follow-up turn
+reused all 25,748 cached tokens. Decode slows as a conversation gets long, because the indexer keys and the K/V beyond
+20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured on a slow link).
 
 ## Troubleshooting
 
