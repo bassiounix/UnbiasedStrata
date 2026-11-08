@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <string>
 #include <thread>
 #include <vector>
@@ -58,6 +59,14 @@ void usage() {
         "                         sizes its expert cache only if the encoder loads first; for cards with room\n"
         "  --picture-cache N      keep the encoded rows of the last N pictures (default 64, up to 1 GiB) so a chat\n"
         "                         that resends its pictures every turn encodes each once; 0 turns it off\n"
+        "  --slot-save-path DIR   (llama-server's) POST /slots/0?action=save|restore {\"filename\": NAME} saves the\n"
+        "                         engine's conversation to DIR/NAME and restores it, also after a restart\n"
+        "  --prefix-file NAME     with --slot-save-path: the first request with a new long system prompt pins the\n"
+        "                         engine's checkpoint at its end and the session is saved to DIR/NAME; it is restored\n"
+        "                         at start, so a new chat after a restart reads only what follows its system prompt\n"
+        "  --system-tags-to-user a,b  <a>...</a> blocks of the system message move to the start of the first user\n"
+        "                         message (pi's <cwd>, opencode's <env>): the system prompt is then the same in every\n"
+        "                         folder and its cached checkpoint matches\n"
         "  --                     everything after it is passed to the engine; --serve is added\n"
         "\n"
         "example (Qwen3.6-35B-A3B from its GGUF):\n"
@@ -95,6 +104,8 @@ int main(int argc, char ** argv) {
     std::vector<char *> llama_argv;
     bool mmproj_gpu = false; // the vision encoder on the card: only where the engine leaves room (a 48 GB card)
     long picture_cache = 64; // --picture-cache N: encoded pictures kept for the turns that resend them
+    std::string prefix_file;               // --prefix-file NAME: the system prompt kept on disk (needs --slot-save-path)
+    std::vector<std::string> system_tags;  // --system-tags-to-user a,b
     llama_argv.push_back(argv[0]);
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -115,6 +126,27 @@ int main(int argc, char ** argv) {
         }
         if (a == "--mmproj-gpu") {
             mmproj_gpu = true;
+            continue;
+        }
+        if (a == "--prefix-file") {
+            if (i + 1 >= argc) { usage(); return 2; }
+            prefix_file = argv[++i];
+            continue;
+        }
+        if (a == "--system-tags-to-user") {
+            if (i + 1 >= argc) { usage(); return 2; }
+            std::string list = argv[++i], tag;
+            for (size_t k = 0; k <= list.size(); ++k) {
+                if (k == list.size() || list[k] == ',') {
+                    if (!tag.empty()) system_tags.push_back(tag);
+                    tag.clear();
+                } else if (std::isalnum((unsigned char) list[k]) || list[k] == '_' || list[k] == '-') {
+                    tag += list[k];
+                } else {
+                    std::fprintf(stderr, "unbiased-strata: --system-tags-to-user takes tag names (letters, digits, _ -)\n");
+                    return 2;
+                }
+            }
             continue;
         }
         if (a == "--picture-cache") {
@@ -164,6 +196,8 @@ int main(int argc, char ** argv) {
 
     strata_context ctx_server;
     ctx_server.set_picture_cache((size_t) picture_cache, (size_t) 1 << 30);
+    ctx_server.set_prefix_file(prefix_file);
+    ctx_server.set_system_tags_to_user(system_tags);
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");

@@ -56,6 +56,12 @@ MODEL_DIR=$MODEL_DIR
 # 1 = retrain a stuck link by itself through the root helper (install.sh --system). Off by default: a retrain twice
 # made the GPU fall off the bus (a reboot to recover)
 #AUTO_RETRAIN=0
+# caching across conversations and restarts (README: Several requests, and caching ...)
+#PARK_MIB=6144
+#PARK_SLOTS=4
+#PREFIX_CACHE=1
+#MOVE_TAGS=cwd,env
+#SESSION_DIR=$HOME/.cache/strata-agent/sessions
 EOF
     echo "install: ~/.config/strata-agent.conf (REPO=$REPO MODEL_DIR=$MODEL_DIR)"
 else

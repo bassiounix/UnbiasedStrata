@@ -37,9 +37,10 @@ fraction of its speed.
 11. [How the configuration was found](#how-the-configuration-was-found)
 12. [Engine changes in this fork](#engine-changes-in-this-fork)
 13. [Context size: 262K (default) and 128K](#context-size-262k-default-and-128k)
-14. [Troubleshooting](#troubleshooting)
-15. [Undo everything](#undo-everything)
-16. [Files in this folder](#files-in-this-folder)
+14. [Several requests, and caching across conversations and restarts](#several-requests-and-caching-across-conversations-and-restarts)
+15. [Troubleshooting](#troubleshooting)
+16. [Undo everything](#undo-everything)
+17. [Files in this folder](#files-in-this-folder)
 
 ## The machine
 
@@ -314,12 +315,14 @@ If the experts cannot be page-locked (not enough free RAM), the engine falls bac
 The server speaks the OpenAI chat API (as llama.cpp's server does): `http://127.0.0.1:18090/v1/chat/completions`,
 model name `swift-iq3_xxs`, streaming and not, plus `/v1/models`, `/health`, `/tokenize`. Images are `image_url`
 parts (data URIs work). Reasoning is on by default; `"chat_template_kwargs": {"enable_thinking": false}` turns it off
-per request. One request is served at a time.
+per request. Requests that arrive together wait in a queue and are answered one after another; conversations are
+cached across chats and restarts ([details](#several-requests-and-caching-across-conversations-and-restarts)).
 
 Settings: `~/.config/strata-agent.conf`, or the same names in the environment for one run, e.g.
 `PORT=8080 strata-agent`, `VISION=0 strata-agent`, `PIN_EXPERTS=0 strata-agent`, `CHUNK=2048 strata-agent`. The
 settings are REPO, MODEL_DIR, HOST, PORT, CONTEXT (262144), CHUNK (4096), PIN_EXPERTS (1), VISION (1),
-VISION_THREADS (12), HOLD_LINK (1), WATCH_LINK (1) and AUTO_RETRAIN (0). Extra arguments are
+VISION_THREADS (12), HOLD_LINK (1), WATCH_LINK (1), AUTO_RETRAIN (0), PARK_MIB (6144), PARK_SLOTS (4),
+PREFIX_CACHE (1), MOVE_TAGS (cwd,env) and SESSION_DIR (~/.cache/strata-agent/sessions). Extra arguments are
 passed to the engine. What every engine option and variable in the launcher does is commented in
 [bin/strata-agent](bin/strata-agent) and explained in [How the configuration was found](#how-the-configuration-was-found).
 
@@ -332,13 +335,17 @@ SH1=$M/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf
 CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 \
 STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 STRATA_PREFILL_IN_DENSE=1 \
 STRATA_PF_GEMM_SCRATCH_MIB=16 STRATA_PF_GEMM_WS_MIB=4 \
+mkdir -p -m 700 ~/.cache/strata-agent/sessions
 build/bin/unbiased-strata --engine build/bin/strata -m $SH1 \
   --host 127.0.0.1 --port 18090 --alias swift-iq3_xxs \
+  --slot-save-path ~/.cache/strata-agent/sessions --prefix-file system-prompt.bin \
+  --system-tags-to-user cwd,env \
   --mmproj $M/mmproj-Qwen3.8-Flash-Next-BF16.gguf --threads 12 \
   -- --pack $M/pack --native $SH1 \
      --expert-profile data/expert-profile.bin --expert-cache 1 --vram-reserve-mib 150 \
      --prefill 4096 --spec 2 --suffix-draft 0 --short-read 0 \
-     --max-context 262144 --kv q4_0 --kv-resident 20480 --resident-experts --vision
+     --max-context 262144 --kv q4_0 --kv-resident 20480 --resident-experts \
+     --conversation-cache-mib 6144 --conversation-cache-slots 4 --vision
 ```
 
 ### Images
@@ -606,6 +613,13 @@ where bytes live, not what is computed).
 | `STRATA_MTP_EXPERTS_HOST=1` | `src/core/mtp.cpp`, `include/strata/core/mtp.hpp` | the MTP draft layer's 512 experts (675 MiB) in pinned RAM instead of VRAM |
 | `STRATA_MTP_DENSE_HOST=1` | `src/core/mtp.cpp`, `include/strata/core/mtp.hpp` | the MTP draft layer's dense weights (110 MiB) in pinned RAM |
 
+Two more changes are not switches: they fix or extend what is there.
+
+| Change | File | What it does |
+|---|---|---|
+| session files without `--mtp` | `src/program/generate.cpp`, `src/core/conversation_state.cpp`, `include/strata/core/conversation_snapshot.hpp` | the engine's `SAVE` / `RESTORE` (session files) always wrote the MTP drafter's K/V layer, which an engine without `--mtp` never allocates, so every save failed with `conversation snapshot: invalid K/V extent`. Without `--mtp` the file now leaves that layer out, as a parked conversation already does |
+| the front end: `--slot-save-path`, `--prefix-file`, `--system-tags-to-user` | `frontend/strata_context.cpp`, `frontend/strata_context.hpp`, `frontend/engine.hpp`, `frontend/main.cpp` | llama-server's `POST /slots/0?action=save\|restore` on the engine's session files; the system prompt kept on disk and restored at start; `<cwd>`/`<env>` blocks moved out of the system prompt ([details](#several-requests-and-caching-across-conversations-and-restarts)) |
+
 Upstream variables used: `STRATA_HC_REQ8`, `STRATA_RESIDENT_PIN`, `STRATA_PREFILL_CPU_SHARE`, `STRATA_MTP_FULL_HEAD`,
 `STRATA_TRACE=1` (prints the free VRAM after each startup step - the tool used to find all of the above).
 
@@ -632,6 +646,47 @@ instead of 186). The window itself was checked then: a passphrase hidden in the 
 found, and the follow-up turn reused all 25,748 cached tokens. Decode slows as a conversation gets long, because the
 indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured on a slow link).
 
+## Several requests, and caching across conversations and restarts
+
+**Several requests at once** are accepted and wait in a queue: the engine answers one, then the next. The engine can
+also decode several conversations together (`--batch N`, [docs/BATCHING.md](../docs/BATCHING.md)), but not here:
+each batch slot needs its own session in VRAM (0.56 GiB at a 32K window in the upstream measurement; this card has
+~0.2 GiB free), `STRATA_PREFILL_IN_HEAD` excludes it, and this front end drives one slot. Where most experts live in
+RAM, as here, upstream measured slots as waiting time, not speed: 11-24% slower per request on a 12 GB card.
+
+**Caching** (all on by default in `strata-agent`, measured 2026-11-08 at 262K with a 25K-token pi-like system prompt):
+
+| Situation | What keeps it fast | Without it | With it |
+|---|---|---|---|
+| a new chat with the same system prompt | the engine's checkpoint at the end of the system prompt (always on) | 53 s (25K read) | ~1.2 s (reads only the new message) |
+| a new pi session in **another folder** (T3 makes a new folder per thread) | `MOVE_TAGS=cwd,env`: pi's `<cwd>...</cwd>` (and opencode's `<env>`) block, which sits at the end of the system prompt, moves to the start of the first user message, so the system prompt is the same in every folder | 21 s (8.6K read: back to the 16K checkpoint) | 1.2-1.4 s (34-39 tokens read) |
+| going back to a chat after another one (an agent and its sub-agents, two terminals) | `PARK_MIB=6144 PARK_SLOTS=4`: up to 4 conversations parked in RAM (~30 KB per token: 0.7 GB at 25K, 1 GB at 32K tokens; the engine never parks below 2.5 GiB of free RAM) | 17 s (7.6K of history read again) | 0.8-1.4 s (parked in 0.25 s, restored in 0.05 s; the answer byte-identical to the one before the switch) |
+| the first chat **after a restart** | `PREFIX_CACHE=1`: the first request with a new long system prompt pins the engine's checkpoint at its end and the session goes to `SESSION_DIR/system-prompt.bin` (~450 MB, 0.6 s); `strata-agent` restores it at start (0.4 s) | 53 s | 1.6 s |
+
+The restore from disk is exact: with the expert placement held fixed (`--adapt-swaps 0`, `--pcie-frac 0.36`,
+`STRATA_PREFILL_CPU_SHARE=0.5`) the first answer after a restart was byte-identical to the same request before it.
+Without those (the default), the adaptive expert tier starts empty after a restart, so a greedy answer can differ
+after a few words, as it can between any two runs.
+
+What it costs: RAM for parked conversations (only while parked, at most `PARK_MIB`), ~450 MB of disk per system
+prompt kept, and the moved tag block. The system prompt file is written once per new system prompt (at most once
+every 10 minutes, so two clients with different system prompts do not write one per request). Turn any of it off:
+`PARK_MIB=0`, `PREFIX_CACHE=0`, `MOVE_TAGS=` (empty).
+
+Saving and restoring any conversation by hand (llama-server's slot API; `SESSION_DIR` is the folder):
+
+```bash
+curl -X POST "http://127.0.0.1:18090/slots/0?action=save"    -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot":0,"filename":"chat1.bin","n_saved":28728,"n_written":479042780,"timings":{"save_ms":577.5}}
+curl -X POST "http://127.0.0.1:18090/slots/0?action=restore" -H "Content-Type: application/json" -d '{"filename": "chat1.bin"}'
+# {"id_slot":0,"filename":"chat1.bin","n_restored":28728,"n_read":479042780,"timings":{"restore_ms":335.6}}
+```
+
+A file restores only into the same engine build and configuration (model, context, K/V format, options): after a
+change the start-up restore says `was not restored` and the next long system prompt is saved again. Files are never
+deleted by the server; `rm ~/.cache/strata-agent/sessions/*.bin` clears them. A request with an `Origin` header (a
+browser page) or a non-JSON body is refused.
+
 ## Troubleshooting
 
 | Message / symptom | Cause | What to do |
@@ -645,6 +700,8 @@ indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 2
 | `strata-agent: could not hold the GPU at full power` | `/usr/local/sbin/gpu-pcie-hold` or its sudoers entry is missing | `install.sh --system` |
 | `gpu-mode status` says `held: yes` with no engine running (idle GPU at ~12.5 W instead of ~6) | `strata-agent` was killed with `kill -9` and could not release the hold | `gpu-mode hold off` |
 | `nvidia-smi`: `Unable to determine the device handle for GPU0 ... Unknown Error`; kernel `NVRM: Xid ... 79, GPU has fallen off the bus` | the GPU crashed (seen twice, each within a second of a link retrain) | reboot; then check `gpu-mode status` and the probe |
+| `conversation cache: skip parking (physical RAM admission ...)` in the log | less free RAM than the parked conversation plus the 2.5 GiB floor (a cgroup or container limit counts too) | close memory-heavy programs; switching chats then reads their history again instead |
+| `... system-prompt.bin was not restored (...)` at start | the file was written by another engine build or configuration | nothing: the next long system prompt is read and saved again |
 | `the whole resident RAM mode does not fit` | less than ~44 GiB available at start; part of the experts is then read from disk | close memory-heavy programs; the engine counts page cache only if the kernel's `MemAvailable` does |
 | the same, inside a container or an app sandbox | a cgroup memory limit counts the page cache of the model files the process read | drop those files' cache before starting (the snippet below) or raise the limit |
 | GPU at 20 W, link at Gen 2 | on battery | plug in the charger |
@@ -666,7 +723,7 @@ for f in glob.glob(M + '/*.gguf') + [M + '/pack/dense.bin']:
 ```bash
 gpu-mode vm && sudo reboot                  # back to the VFIO passthrough setup (only if you used gpu-mode host)
 rm ~/.local/bin/strata-agent ~/.local/bin/gpu-mode ~/.config/strata-agent.conf ~/.config/gpu-mode.conf
-rm -r ~/.local/share/gpu-mode
+rm -r ~/.local/share/gpu-mode ~/.cache/strata-agent
 gpu-mode hold off                           # if strata-agent was killed while holding the GPU
 sudo rm /usr/local/sbin/gpu-link-retrain /etc/sudoers.d/gpu-link-retrain
 sudo rm /usr/local/sbin/gpu-pcie-hold /etc/sudoers.d/gpu-pcie-hold

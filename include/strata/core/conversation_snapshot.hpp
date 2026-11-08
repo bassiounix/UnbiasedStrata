@@ -104,6 +104,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
+// The same without a draft layer when `draft` is null: an engine without --mtp has no draft K/V to save (its state
+// was never allocated); such a file restores only through the validate/restore calls with `draft == nullptr`.
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };

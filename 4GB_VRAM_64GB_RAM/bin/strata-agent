@@ -20,9 +20,21 @@
 # off the bus (NVRM Xid 79, a reboot to recover).  AUTO_RETRAIN=1 lets it retrain by itself through the root helper
 # gpu-link-retrain - at startup, and while serving at most once every 5 minutes.
 #
+# Several requests: they queue and are answered one after another (a parallel batch slot needs ~0.5 GiB of VRAM per
+# conversation; this card has ~0.2 GiB free).  Caching across conversations and restarts:
+#   - a new chat with the same system prompt starts after it (the engine's checkpoints, always on);
+#   PARK_MIB=6144 PARK_SLOTS=4: up to 4 conversations parked in RAM (~30 KB per token: ~1 GB for a 32K-token chat),
+#     so switching between chats (an agent and its sub-agents, two terminals) does not read their history again;
+#   PREFIX_CACHE=1: the system prompt's state saved in SESSION_DIR (~1 GB file) and restored at start, so the first
+#     chat after a restart starts after its system prompt (the front end's --prefix-file);
+#   MOVE_TAGS=cwd,env: pi's <cwd> and opencode's <env> blocks move from the system prompt to the first user message,
+#     so the system prompt is the same in every folder (the front end's --system-tags-to-user; empty = off);
+#   SESSION_DIR=~/.cache/strata-agent/sessions: also llama-server's POST /slots/0?action=save|restore {"filename": ...}.
+#
 # Settings: ~/.config/strata-agent.conf (written by install.sh); any of them can be overridden from the environment:
 #   REPO=~/dev/UnbiasedStrata  MODEL_DIR=~/dev/models/swift-iq3_xxs  HOST=127.0.0.1  PORT=18090
 #   CONTEXT=262144  CHUNK=4096  PIN_EXPERTS=1  VISION=1  VISION_THREADS=12  HOLD_LINK=1  WATCH_LINK=1  AUTO_RETRAIN=0
+#   PARK_MIB=6144  PARK_SLOTS=4  PREFIX_CACHE=1  MOVE_TAGS=cwd,env  SESSION_DIR=~/.cache/strata-agent/sessions
 # Extra arguments go to the engine (after the front end's `--`).
 set -uo pipefail
 
@@ -30,7 +42,9 @@ CONF=${STRATA_AGENT_CONF:-$HOME/.config/strata-agent.conf}
 _env_REPO=${REPO-}; _env_MODEL_DIR=${MODEL_DIR-}; _env_HOST=${HOST-}; _env_PORT=${PORT-}; _env_CONTEXT=${CONTEXT-}
 _env_CHUNK=${CHUNK-}; _env_VISION=${VISION-}; _env_VISION_THREADS=${VISION_THREADS-}
 _env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}; _env_PIN_EXPERTS=${PIN_EXPERTS-}
-_env_HOLD_LINK=${HOLD_LINK-}
+_env_HOLD_LINK=${HOLD_LINK-}; _env_PARK_MIB=${PARK_MIB-}; _env_PARK_SLOTS=${PARK_SLOTS-}
+_env_PREFIX_CACHE=${PREFIX_CACHE-}; _env_SESSION_DIR=${SESSION_DIR-}
+_env_MOVE_TAGS=${MOVE_TAGS-}; _env_MOVE_TAGS_set=${MOVE_TAGS+1}   # MOVE_TAGS= (empty) turns it off
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
 REPO=${_env_REPO:-${REPO:-$HOME/dev/UnbiasedStrata}}
@@ -45,6 +59,11 @@ VISION_THREADS=${_env_VISION_THREADS:-${VISION_THREADS:-12}}
 WATCH_LINK=${_env_WATCH_LINK:-${WATCH_LINK:-1}}
 AUTO_RETRAIN=${_env_AUTO_RETRAIN:-${AUTO_RETRAIN:-0}}
 HOLD_LINK=${_env_HOLD_LINK:-${HOLD_LINK:-1}}
+PARK_MIB=${_env_PARK_MIB:-${PARK_MIB:-6144}}
+PARK_SLOTS=${_env_PARK_SLOTS:-${PARK_SLOTS:-4}}
+PREFIX_CACHE=${_env_PREFIX_CACHE:-${PREFIX_CACHE:-1}}
+if [[ -n $_env_MOVE_TAGS_set ]]; then MOVE_TAGS=$_env_MOVE_TAGS; else MOVE_TAGS=${MOVE_TAGS-cwd,env}; fi
+SESSION_DIR=${_env_SESSION_DIR:-${SESSION_DIR:-$HOME/.cache/strata-agent/sessions}}
 HELPER=/usr/local/sbin/gpu-link-retrain
 HOLD=/usr/local/sbin/gpu-pcie-hold
 
@@ -136,6 +155,13 @@ fi
 
 FRONT=()
 ENGINE=()
+# caching across conversations and restarts (the header above)
+if [[ -n $SESSION_DIR ]] && mkdir -p -m 700 "$SESSION_DIR"; then
+    FRONT+=(--slot-save-path "$SESSION_DIR")
+    [[ $PREFIX_CACHE == 1 ]] && FRONT+=(--prefix-file system-prompt.bin)
+fi
+[[ -n $MOVE_TAGS ]] && FRONT+=(--system-tags-to-user "$MOVE_TAGS")
+(( PARK_MIB > 0 )) && ENGINE+=(--conversation-cache-mib "$PARK_MIB" --conversation-cache-slots "$PARK_SLOTS")
 if [[ $VISION == 1 && -n $MMPROJ ]]; then
     FRONT+=(--mmproj "$MMPROJ" --threads "$VISION_THREADS")   # encoded on the CPU (the card has no room for it)
     ENGINE+=(--vision)

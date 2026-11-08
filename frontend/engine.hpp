@@ -6,6 +6,7 @@
 // loop polls it between tasks so a cancel from a disconnected client is seen within the poll interval.
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <csignal>
@@ -213,6 +214,69 @@ public:
             if (rc == 0) { continue; }
             if (got.rfind(reply_prefix, 0) == 0) { reply = got; return true; }
             if (got.rfind("ERR", 0) == 0) { err = got.size() > 4 ? got.substr(4) : "the engine reported an error"; return false; }
+        }
+    }
+
+    // A session file command between requests: `SAVE <path>` or `RESTORE <path>` (the engine's session files,
+    // docs/DETAILS.md "Session files"). While it works the engine says `SESSION <done> <total>` per block moved and
+    // `SWAIT <phase> <seconds>` before a step that blocks; each extends the wait. The reply is
+    // `SAVED|RESTORED <tokens> <bytes> <ms>`, or `SERR <kind> <published> <why>` (refused, the session as it was;
+    // kind: invalid, storage, memory, io), or `ERR ...` (the engine ends: `fatal`).
+    struct SessionReply {
+        bool        ok = false, fatal = false;
+        long long   tokens = 0, bytes = 0;
+        double      ms = 0;
+        std::string kind, message;
+    };
+    bool session(const std::string & verb, const std::string & path, SessionReply & r, int base_timeout_ms = 120000) {
+        r = SessionReply{};
+        if (!alive_ || !send(verb + " " + path + "\n")) {
+            r.fatal = true; r.message = "the engine is not running";
+            return false;
+        }
+        const std::string done = verb == "SAVE" ? "SAVED " : "RESTORED ";
+        int64_t deadline = now_ms() + base_timeout_ms;
+        std::string got;
+        while (true) {
+            const int64_t left = deadline - now_ms();
+            if (left <= 0) { r.fatal = true; r.message = "no reply from the engine"; return false; }
+            const int rc = read_line(got, (int) std::min<int64_t>(left, 1000));
+            if (rc < 0) { r.fatal = true; r.message = "the engine exited"; return false; }
+            if (rc == 0) { continue; }
+            if (got.rfind(done, 0) == 0) {
+                std::sscanf(got.c_str() + done.size(), "%lld %lld %lf", &r.tokens, &r.bytes, &r.ms);
+                r.ok = true;
+                return true;
+            }
+            if (got.rfind("SWAIT ", 0) == 0) {
+                char phase[64] = {0};
+                long long s = 0;
+                if (std::sscanf(got.c_str(), "SWAIT %63s %lld", phase, &s) == 2) {
+                    deadline = std::max<int64_t>(deadline, now_ms() + s * 1000 + 5000);
+                }
+                continue;
+            }
+            if (got.rfind("SESSION ", 0) == 0) {
+                deadline = std::max<int64_t>(deadline, now_ms() + base_timeout_ms);
+                continue;
+            }
+            if (got.rfind("SERR ", 0) == 0) {
+                char kind[32] = {0};
+                int published = 0, used = 0;
+                if (std::sscanf(got.c_str(), "SERR %31s %d %n", kind, &published, &used) >= 2 && used > 0) {
+                    r.message = got.substr((size_t) used);
+                } else {
+                    r.message = got.substr(5);
+                }
+                r.kind = kind[0] ? kind : "io";
+                return false;
+            }
+            if (got.rfind("ERR", 0) == 0 || got.rfind("FATAL", 0) == 0) {
+                r.fatal = true;
+                r.message = got;
+                return false;
+            }
+            // anything else (INFO, WARN) is chatter
         }
     }
 

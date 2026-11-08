@@ -34,6 +34,14 @@ struct strata_context {
     bool load(common_params & params, std::string & err);
     // --picture-cache: how many pictures' encoded rows are kept for the turns that resend them (0: none); before load()
     void set_picture_cache(size_t entries, size_t bytes);
+    // --prefix-file NAME (needs --slot-save-path DIR): the system prompt kept on disk. The first request with a new
+    // long system prompt pins the engine's checkpoint at its end and the session is saved to DIR/NAME after the
+    // answer; load() restores DIR/NAME, so after a restart a new chat starts reading after its system prompt.
+    void set_prefix_file(const std::string & name);
+    // --system-tags-to-user a,b: each <a>...</a> block of the system message moves to the start of the first user
+    // message, so a system prompt that ends with per-session details (pi's <cwd>, opencode's <env>) is the same
+    // prompt in every session and its cached checkpoint matches; before load()
+    void set_system_tags_to_user(const std::vector<std::string> & tags);
 
     // Blocks the calling thread running the task loop until terminate().
     void start_loop();

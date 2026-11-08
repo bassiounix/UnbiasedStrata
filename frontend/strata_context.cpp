@@ -25,6 +25,10 @@
 #include "mtmd-helper.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <climits>
+#include <cstdlib>
+#include <cstring>
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
@@ -207,6 +211,200 @@ struct strata_context_impl {
 
     Slot slot;
 
+    // ---- session files and the system prompt on disk --------------------------------------------------------------
+    // --slot-save-path DIR (absolute, ends with '/'): llama-server's POST /slots/0?action=save|restore, as the engine's
+    // SAVE / RESTORE. --prefix-file NAME: DIR/NAME holds the session of the first request with the current long system
+    // prompt, with the engine's checkpoint at the system prompt's end pinned (pin=N) so the file keeps exactly that
+    // resume point; NAME.prefix holds the hash of the system prompt's tokens. Restored in load().
+    std::string session_dir;
+    std::string prefix_file;
+    std::vector<std::string> move_tags;     // --system-tags-to-user
+    llama_token turn_token = -1;            // <|im_start|>: the engine's --turn-token, where its root checkpoint sits
+    int64_t     prefix_min_tokens = 2048;   // the engine's --prompt-cache-root: shorter system prompts get no root
+    uint64_t    saved_prefix_hash = 0;      // the system prompt DIR/NAME holds (0: none)
+    int64_t     prefix_saved_at_ms = 0;
+    int64_t     pending_pin = -1;           // this request pins its system prompt's end, then the session is saved
+    uint64_t    pending_pin_hash = 0;
+    static constexpr int64_t PREFIX_SAVE_GAP_MS = 10 * 60 * 1000; // two alternating system prompts: one save per 10 min
+
+    static uint64_t hash_tokens(const std::vector<int32_t> & ids, size_t n) {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a
+        for (size_t i = 0; i < n && i < ids.size(); ++i) {
+            uint32_t v = (uint32_t) ids[i];
+            for (int b = 0; b < 4; ++b) { h ^= (v & 0xff); h *= 1099511628211ull; v >>= 8; }
+        }
+        return h ? h : 1;
+    }
+
+    // where the engine's root checkpoint sits for these ids: the next turn's start after the system turn, when the
+    // system turn is long enough (generate.cpp root_at); -1 when there is none
+    int64_t system_prompt_end(const std::vector<int32_t> & ids) const {
+        if (turn_token < 0 || ids.size() < 3 || ids[0] != turn_token) {
+            return -1;
+        }
+        for (size_t i = 1; i + 1 < ids.size(); ++i) {
+            if (ids[i] == turn_token) {
+                return (int64_t) i >= prefix_min_tokens ? (int64_t) i : -1;
+            }
+        }
+        return -1;
+    }
+
+    // SAVE / RESTORE through the engine, between requests (on the queue thread). Returns the HTTP-side error type on
+    // a refusal; a fatal reply means the engine is gone.
+    bool engine_session(bool save, const std::string & path, Engine::SessionReply & r) {
+        const bool ok = engine.session(save ? "SAVE" : "RESTORE", path, r);
+        if (ok) {
+            SRV_INF("session %s %s: %lld tokens, %lld bytes, %.1f ms\n", save ? "saved to" : "restored from",
+                    path.c_str(), r.tokens, r.bytes, r.ms);
+        } else {
+            SRV_WRN("session %s %s refused (%s): %s\n", save ? "save to" : "restore from", path.c_str(),
+                    r.fatal ? "fatal" : r.kind.c_str(), r.message.c_str());
+            if (r.fatal) {
+                engine_dead = true;
+                queue_tasks.terminate();
+            }
+        }
+        return ok;
+    }
+
+    static error_type session_error_type(const Engine::SessionReply & r) {
+        if (r.fatal)            return ERROR_TYPE_UNAVAILABLE;
+        if (r.kind == "invalid") return ERROR_TYPE_INVALID_REQUEST;
+        if (r.kind == "memory")  return ERROR_TYPE_UNAVAILABLE;
+        return ERROR_TYPE_SERVER;   // storage, io
+    }
+
+    void run_slot_action(server_task && task) {
+        const bool save = task.type == SERVER_TASK_TYPE_SLOT_SAVE;
+        if (task.slot_action.id_slot != 0) {
+            send_error(task, "this server has one slot: 0", ERROR_TYPE_INVALID_REQUEST);
+            return;
+        }
+        if (!save && ::access(task.slot_action.filepath.c_str(), R_OK) != 0) {
+            send_error(task, "no session file " + task.slot_action.filename, ERROR_TYPE_NOT_FOUND);
+            return;
+        }
+        Engine::SessionReply r;
+        if (!engine_session(save, task.slot_action.filepath, r)) {
+            send_error(task, std::string("session ") + (save ? "save" : "restore") + ": " + r.message, session_error_type(r));
+            return;
+        }
+        if (!save && task.slot_action.filepath == session_dir + prefix_file) {
+            saved_prefix_hash = read_prefix_hash();
+        }
+        auto res = std::make_unique<server_task_result_slot_save_load>();
+        res->id       = task.id;
+        res->id_slot  = 0;
+        res->filename = task.slot_action.filename;
+        res->is_save  = save;
+        res->n_tokens = (size_t) r.tokens;
+        res->n_bytes  = (size_t) r.bytes;
+        res->t_ms     = r.ms;
+        queue_results.send(std::move(res));
+    }
+
+    uint64_t read_prefix_hash() const {
+        uint64_t h = 0;
+        if (std::FILE * f = std::fopen((session_dir + prefix_file + ".prefix").c_str(), "r")) {
+            if (std::fscanf(f, "%" SCNx64, &h) != 1) {
+                h = 0;
+            }
+            std::fclose(f);
+        }
+        return h;
+    }
+
+    void write_prefix_hash(uint64_t h) const {
+        const std::string p = session_dir + prefix_file + ".prefix";
+        if (std::FILE * f = std::fopen((p + ".tmp").c_str(), "w")) {
+            std::fprintf(f, "%016" PRIx64 "\n", h);
+            const bool ok = std::fflush(f) == 0;
+            std::fclose(f);
+            if (ok) {
+                std::rename((p + ".tmp").c_str(), p.c_str());
+            }
+        }
+    }
+
+    // after the answer of a request that pinned a new system prompt: its session goes to DIR/NAME
+    void save_prefix_after_request() {
+        if (pending_pin < 0) {
+            return;
+        }
+        const uint64_t h = pending_pin_hash;
+        pending_pin = -1;
+        Engine::SessionReply r;
+        prefix_saved_at_ms = Engine::now_ms();
+        if (engine_session(true, session_dir + prefix_file, r)) {
+            saved_prefix_hash = h;
+            write_prefix_hash(h);
+        }
+    }
+
+    // --system-tags-to-user: <tag>...</tag> blocks leave the system message for the start of the first user message
+    void move_system_tags(json & body) const {
+        if (move_tags.empty() || !body.contains("messages") || !body.at("messages").is_array()) {
+            return;
+        }
+        json & msgs = body.at("messages");
+        size_t sys = msgs.size(), user = msgs.size();
+        for (size_t i = 0; i < msgs.size(); ++i) {
+            const std::string role = json_value(msgs[i], "role", std::string());
+            if (sys == msgs.size() && (role == "system" || role == "developer")) sys = i;
+            if (role == "user") { user = i; break; }
+        }
+        if (sys == msgs.size() || user == msgs.size() || user < sys || !msgs[sys].contains("content")) {
+            return;
+        }
+        json & sc = msgs[sys].at("content");
+        std::string moved;
+        auto cut = [&](std::string & text) {
+            for (const std::string & tag : move_tags) {
+                const std::string open = "<" + tag + ">", close = "</" + tag + ">";
+                size_t a;
+                while ((a = text.find(open)) != std::string::npos) {
+                    const size_t b = text.find(close, a + open.size());
+                    if (b == std::string::npos) break;
+                    size_t from = a, to = b + close.size();
+                    while (from > 0 && (text[from - 1] == '\n' || text[from - 1] == ' ')) --from;   // the blank line before it
+                    moved += text.substr(a, b + close.size() - a) + "\n\n";
+                    text.erase(from, to - from);
+                }
+            }
+        };
+        if (sc.is_string()) {
+            std::string text = sc.get<std::string>();
+            cut(text);
+            sc = text;
+        } else if (sc.is_array()) {
+            for (json & part : sc) {
+                if (part.is_object() && json_value(part, "type", std::string()) == "text" && part.contains("text") &&
+                    part.at("text").is_string()) {
+                    std::string text = part.at("text").get<std::string>();
+                    cut(text);
+                    part["text"] = text;
+                }
+            }
+        }
+        if (moved.empty()) {
+            return;
+        }
+        json & uc = msgs[user]["content"];
+        if (uc.is_string()) {
+            uc = moved + uc.get<std::string>();
+        } else if (uc.is_array()) {
+            json parts = json::array();
+            parts.push_back(json{{"type", "text"}, {"text", moved}});
+            for (const json & part : uc) {
+                parts.push_back(part);
+            }
+            uc = parts;
+        } else {
+            uc = moved;
+        }
+    }
+
     // ---- queue callbacks -------------------------------------------------------------------------------------------
 
     void send_error(int id_task, const std::string & error, enum error_type type, int32_t n_prompt_tokens = 0) {
@@ -240,6 +438,15 @@ struct strata_context_impl {
                 if (slot.active() && slot.task->id == task.id_target) {
                     cancel_current();
                 }
+                return true;
+
+            case SERVER_TASK_TYPE_SLOT_SAVE:
+            case SERVER_TASK_TYPE_SLOT_RESTORE:
+                if (slot.active()) {   // between requests only: it waits for the running one
+                    queue_tasks.defer(std::move(task));
+                    return true;
+                }
+                run_slot_action(std::move(task));
                 return true;
 
             case SERVER_TASK_TYPE_NEXT_RESPONSE:
@@ -341,7 +548,26 @@ struct strata_context_impl {
                     t.id, t.params.sampling.grammar.grammar.size());
         }
 
-        const std::string header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
+        std::string header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
+        // --prefix-file: a long system prompt the file does not hold yet pins its end (the engine's root checkpoint)
+        // and the session is saved after the answer; at most once per PREFIX_SAVE_GAP_MS, so two alternating system
+        // prompts do not write a file per request. Only this request pins: a pin on later requests would keep the
+        // engine from parking the conversation a new chat leaves (generate.cpp pin_sibling).
+        pending_pin = -1;
+        if (!prefix_file.empty() && !session_dir.empty()) {
+            const int64_t end = system_prompt_end(ids);
+            if (end > 0) {
+                const uint64_t h = hash_tokens(ids, (size_t) end);
+                if (h != saved_prefix_hash &&
+                    (prefix_saved_at_ms == 0 || Engine::now_ms() - prefix_saved_at_ms >= PREFIX_SAVE_GAP_MS)) {
+                    pending_pin      = end;
+                    pending_pin_hash = h;
+                    // right after `GEN <max_new>`: a GENI header ends with `image_pad=<id> <file>`
+                    const size_t at = header.find(' ', header.find(' ') + 1);
+                    header.insert(at == std::string::npos ? header.size() : at, " pin=" + std::to_string(end));
+                }
+            }
+        }
         if (!engine.send_request(header, ids)) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
             slot.release();
@@ -830,6 +1056,12 @@ struct strata_context_impl {
             }
         }
         send_final_response();
+        if (pending_pin >= 0) {
+            // the answer is out (a client cancel returned above; finish=cancel here is the front end's own STOP at
+            // n_predict); the next request waits for the save (~1 s)
+            save_prefix_after_request();
+        }
+        pending_pin = -1;
         finish_slot();
     }
 
@@ -1259,6 +1491,14 @@ void strata_context::set_picture_cache(size_t entries, size_t bytes) {
     impl->pictures.configure(entries, bytes);
 }
 
+void strata_context::set_prefix_file(const std::string & name) {
+    impl->prefix_file = name;
+}
+
+void strata_context::set_system_tags_to_user(const std::vector<std::string> & tags) {
+    impl->move_tags = tags;
+}
+
 bool strata_context::load(common_params & params, std::string & err) {
     auto & I = *impl;
     I.params = params;
@@ -1347,6 +1587,42 @@ bool strata_context::load(common_params & params, std::string & err) {
         LOG_INF("engine info: %s=%s\n", kv.first.c_str(), kv.second.c_str());
     }
     LOG_INF("engine ready: context %lld tokens, model %s\n", I.n_ctx, I.model_name.c_str());
+
+    // session files (--slot-save-path) and the system prompt on disk (--prefix-file)
+    if (!params.slot_save_path.empty()) {
+        char real[PATH_MAX];
+        if (::realpath(params.slot_save_path.c_str(), real) == nullptr) {
+            err = "--slot-save-path " + params.slot_save_path + ": " + std::strerror(errno);
+            return false;
+        }
+        I.session_dir = std::string(real) + "/";
+        LOG_INF("session files in %s (POST /slots/0?action=save|restore)\n", I.session_dir.c_str());
+    }
+    if (!I.prefix_file.empty()) {
+        if (I.session_dir.empty() || !fs_validate_filename(I.prefix_file)) {
+            err = "--prefix-file needs --slot-save-path and a plain file name";
+            return false;
+        }
+        const llama_tokens t = common_tokenize(I.vocab, "<|im_start|>", /* add_special */ false, /* parse_special */ true);
+        I.turn_token = t.size() == 1 ? t[0] : -1;
+        if (I.turn_token < 0) {
+            LOG_WRN("%s", "--prefix-file: this vocabulary has no <|im_start|> token; the system prompt is not kept on disk\n");
+        }
+        const std::string path = I.session_dir + I.prefix_file;
+        if (I.turn_token >= 0 && ::access(path.c_str(), R_OK) == 0) {
+            Engine::SessionReply r;
+            if (I.engine_session(false, path, r)) {
+                I.saved_prefix_hash = I.read_prefix_hash();
+                LOG_INF("system prompt restored from %s: %lld tokens in %.0f ms\n", path.c_str(), r.tokens, r.ms);
+            } else if (r.fatal) {
+                err = "engine: " + r.message;
+                return false;
+            } else {
+                LOG_WRN("%s was not restored (%s): the next long system prompt is read and saved again\n",
+                        path.c_str(), r.message.c_str());
+            }
+        }
+    }
 
     I.queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
         return impl->process_new_task(std::move(task), is_yielding);
@@ -1456,6 +1732,7 @@ void strata_context::init_routes(server_http_context & http) {
         std::vector<raw_buffer> files;
         std::vector<std::pair<size_t, size_t>> plain;
         json body = json::parse(req.body);
+        I->move_system_tags(body);   // --system-tags-to-user
         json body_parsed = parse_chat(body, files, plain);
         return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
     };
@@ -1525,6 +1802,67 @@ void strata_context::init_routes(server_http_context & http) {
         return res;
     };
 
+    // llama-server's slot API for the engine's session files: POST /slots/0?action=save|restore {"filename": NAME}.
+    // A browser page cannot use it: a request with an Origin header is refused, and the body must be JSON.
+    auto post_slots = [I](const server_http_req & req) {
+        auto res = I->create_response();
+        if (I->session_dir.empty()) {
+            res->error(format_error_response("This server does not support slots action. Start it with `--slot-save-path`", ERROR_TYPE_NOT_SUPPORTED));
+            return res;
+        }
+        for (const auto & h : req.headers) {
+            std::string k = h.first;
+            std::transform(k.begin(), k.end(), k.begin(), ::tolower);
+            if (k == "origin") {
+                res->error(format_error_response("slot actions are not taken from browser pages", ERROR_TYPE_PERMISSION));
+                return res;
+            }
+            if (k == "content-type" && h.second.find("application/json") == std::string::npos) {
+                res->error(format_error_response("the body must be application/json", ERROR_TYPE_INVALID_REQUEST));
+                return res;
+            }
+        }
+        int id_slot = -1;
+        try {
+            id_slot = std::stoi(req.get_param("id_slot"));
+        } catch (const std::exception &) {
+            res->error(format_error_response("Invalid slot ID", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const std::string action = req.get_param("action");
+        if (action != "save" && action != "restore") {
+            res->error(format_error_response(action == "erase" ? "erase is not supported: delete the file"
+                                                               : "Invalid action", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        const json body = json::parse(req.body);
+        const std::string filename = json_value(body, "filename", std::string());
+        if (!fs_validate_filename(filename) || filename.empty() || filename[0] == '.') {
+            res->error(format_error_response("Invalid filename", ERROR_TYPE_INVALID_REQUEST));
+            return res;
+        }
+        auto & rd = res->rd;
+        {
+            server_task task(action == "save" ? SERVER_TASK_TYPE_SLOT_SAVE : SERVER_TASK_TYPE_SLOT_RESTORE);
+            task.id = rd.get_new_id();
+            task.slot_action.id_slot  = id_slot;
+            task.slot_action.filename = filename;
+            task.slot_action.filepath = I->session_dir + filename;
+            rd.post_task(std::move(task));
+        }
+        auto result = rd.next(req.should_stop);
+        if (!result) {
+            return res;   // the connection closed
+        }
+        if (result->is_error()) {
+            res->error(result->to_json());
+            return res;
+        }
+        res->ok(result->to_json());
+        return res;
+    };
+
+    http.post("/slots/:id_slot",      ex_wrapper(post_slots));
     http.get ("/health",              ex_wrapper(get_health));
     http.get ("/v1/health",           ex_wrapper(get_health));
     http.get ("/props",               ex_wrapper(get_props));
