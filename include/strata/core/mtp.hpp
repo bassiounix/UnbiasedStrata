@@ -246,6 +246,8 @@ private:
     std::vector<Tensor> tensors_;
     uint8_t* dense_ = nullptr;
     uint8_t* experts_ = nullptr;
+    void* experts_host_ = nullptr;   ///< STRATA_MTP_EXPERTS_HOST: the pinned allocation `experts_` maps (freed with cudaFreeHost)
+    void* dense_host_ = nullptr;     ///< STRATA_MTP_DENSE_HOST: the pinned allocation `dense_` maps (freed with cudaFreeHost)
     // Slot drafters borrow immutable weights and head; each still owns its state and scratch.
     bool owns_weights_ = true;
     bool owns_draft_head_ = true;

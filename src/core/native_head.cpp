@@ -9,7 +9,6 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
-#include <string_view>
 
 namespace strata::core {
 
@@ -27,7 +26,7 @@ void NativeHead::unload() {
     host_copy_ = nullptr;
 }
 
-bool NativeHead::keep_host_copy(std::string_view err) {
+bool NativeHead::keep_host_copy(std::string& err) {
     if (!loaded()) { err = "native head: keep_host_copy before load"; return false; }
     if (host_copy_) return true;
     if (cudaHostAlloc(&host_copy_, bytes_, cudaHostAllocDefault) != cudaSuccess) {
@@ -43,7 +42,7 @@ bool NativeHead::keep_host_copy(std::string_view err) {
     return true;
 }
 
-bool NativeHead::restore(std::string_view err) {
+bool NativeHead::restore(std::string& err) {
     if (!loaded() || !host_copy_) { err = "native head: restore without a host copy"; return false; }
     // everything that may still write the loaned VRAM (the prompt path's streams) is done first
     cudaError_t e = cudaDeviceSynchronize();

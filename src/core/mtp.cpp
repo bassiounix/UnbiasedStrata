@@ -153,8 +153,10 @@ MtpDrafter::~MtpDrafter() {
     if (side_) cudaStreamDestroy(side_);
     if (sh_fork_) cudaEventDestroy(sh_fork_);
     if (sh_join_) cudaEventDestroy(sh_join_);
-    if (owns_weights_ && dense_) cudaFree(dense_);
-    if (owns_weights_ && experts_) cudaFree(experts_);
+    if (owns_weights_ && dense_host_) cudaFreeHost(dense_host_);   // STRATA_MTP_DENSE_HOST
+    else if (owns_weights_ && dense_) cudaFree(dense_);
+    if (owns_weights_ && experts_host_) cudaFreeHost(experts_host_);   // STRATA_MTP_EXPERTS_HOST
+    else if (owns_weights_ && experts_) cudaFree(experts_);
     if (state_arena_) cudaFree(state_arena_);
     if (arena_) cudaFree(arena_);
     if (head_logits_) cudaFree(head_logits_);
@@ -293,7 +295,27 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
         }
         std::vector<uint8_t> blob;
         if (!read_file(rt_dir + "/dense.bin", blob)) { err = "mtp: cannot read dense.bin"; return false; }
-        const cudaError_t alloc = cudaMalloc((void**) &dense_, blob.size());
+        // STRATA_MTP_DENSE_HOST=1 (opt-in, small cards): the dense blob (~111 MiB) in pinned, device-mapped RAM; every
+        // drafted token then reads it over PCIe (~8.5 ms at 13 GB/s), and the VRAM stays free
+        static const bool dense_host = [] { const char* e = std::getenv("STRATA_MTP_DENSE_HOST"); return e && e[0] == '1'; }();
+        if (dense_host) {
+            void* h = nullptr;
+            void* d = nullptr;
+            if (cudaHostAlloc(&h, blob.size(), cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (h) cudaFreeHost(h);
+                err = "mtp: STRATA_MTP_DENSE_HOST: cannot pin " + std::to_string(blob.size() >> 20) + " MiB of RAM";
+                return false;
+            }
+            std::memcpy(h, blob.data(), blob.size());
+            dense_ = (uint8_t*) d;
+            dense_host_ = h;
+            std::fprintf(stderr, "strata: STRATA_MTP_DENSE_HOST=1: the draft layer's %zu MiB of dense weights are in pinned RAM\n",
+                         blob.size() >> 20);
+            if (q4_ && !make_q4_dense(blob, err)) return false;
+        }
+        const cudaError_t alloc = dense_host ? cudaSuccess : cudaMalloc((void**) &dense_, blob.size());
         if (alloc != cudaSuccess) {
             size_t free_bytes = 0, total_bytes = 0;
             const cudaError_t info = cudaMemGetInfo(&free_bytes, &total_bytes);
@@ -302,9 +324,11 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
                   (info == cudaSuccess ? std::to_string(free_bytes >> 20) + " MiB" : "unknown");
             return false;
         }
-        cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
-        vram_ += blob.size();
-        if (q4_ && !make_q4_dense(blob, err)) return false;
+        if (!dense_host) {
+            cudaMemcpy(dense_, blob.data(), blob.size(), cudaMemcpyHostToDevice);
+            vram_ += blob.size();
+            if (q4_ && !make_q4_dense(blob, err)) return false;
+        }
     }
     // ---- the 512 routed experts, one blob each
     if (shared == nullptr) {
@@ -317,18 +341,43 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
             FILE* f;
             ~Closer() { if (f != nullptr) std::fclose(f); }
         } closer{f};
-        if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
+        // STRATA_MTP_EXPERTS_HOST=1 (opt-in, small cards): the 512 experts in pinned, device-mapped RAM instead of
+        // VRAM.  The draft MoE reads them through the same pointer (UVA, zero-copy): only the experts a drafted token
+        // routes to cross PCIe (~10 blobs, ~14 MB a draft token), and the 708 MB of VRAM stay free.
+        static const bool experts_host = [] { const char* e = std::getenv("STRATA_MTP_EXPERTS_HOST"); return e && e[0] == '1'; }();
+        if (experts_host) {
+            void* h = nullptr;
+            void* d = nullptr;
+            if (cudaHostAlloc(&h, bytes, cudaHostAllocMapped | cudaHostAllocPortable) != cudaSuccess ||
+                cudaHostGetDevicePointer(&d, h, 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                if (h) cudaFreeHost(h);
+                err = "mtp: STRATA_MTP_EXPERTS_HOST: cannot pin " + std::to_string(bytes >> 20) + " MiB of RAM for the experts";
+                return false;
+            }
+            if (std::fread(h, 1, (size_t) bytes, f) != (size_t) bytes) {
+                cudaFreeHost(h);
+                err = "mtp: experts.bin is truncated";
+                return false;
+            }
+            experts_ = (uint8_t*) d;
+            experts_host_ = h;
+            std::fprintf(stderr, "strata: STRATA_MTP_EXPERTS_HOST=1: the draft layer's %llu MiB of experts are in pinned RAM\n",
+                         (unsigned long long) (bytes >> 20));
+        } else {
+            if (cudaMalloc((void**) &experts_, bytes) != cudaSuccess) { err = "mtp: the 512 experts do not fit in VRAM"; return false; }
 #if !defined(_WIN32)
-        strata::platform::advise_willneed(fileno(f), 0, bytes);
+            strata::platform::advise_willneed(fileno(f), 0, bytes);
 #endif
-        std::vector<uint8_t> chunk(64u << 20);
-        for (uint64_t off = 0; off < bytes;) {
-            const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
-            if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
-            cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
-            off += n;
+            std::vector<uint8_t> chunk(64u << 20);
+            for (uint64_t off = 0; off < bytes;) {
+                const uint64_t n = std::min<uint64_t>(chunk.size(), bytes - off);
+                if (std::fread(chunk.data(), 1, (size_t) n, f) != (size_t) n) { err = "mtp: experts.bin is truncated"; return false; }
+                cudaMemcpy(experts_ + off, chunk.data(), n, cudaMemcpyHostToDevice);
+                off += n;
+            }
+            vram_ += bytes;
         }
-        vram_ += bytes;
     }
     const char* required[] = {"fc_embedding.weight", "fc_hidden.weight", "self_attn.q_proj.weight", "self_attn.k_proj.weight",
                               "self_attn.v_proj.weight", "self_attn.o_proj.weight", "mlp.shared_expert.gate_proj.weight",

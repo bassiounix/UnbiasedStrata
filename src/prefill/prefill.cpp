@@ -1078,8 +1078,27 @@ void Prefill::release() {
 }
 
 namespace {
-constexpr int64_t GEMM_SCRATCH = 32ll << 20;        // FP16 elements for the largest dequantized dense weight
-constexpr size_t GEMM_WS = 32u << 20;               // cuBLAS workspace
+// The dense GEMMs' FP16 dequantization scratch (default 64 MiB: the largest dense weight in one piece) and the cuBLAS
+// workspace (default 32 MiB).  STRATA_PF_GEMM_SCRATCH_MIB / STRATA_PF_GEMM_WS_MIB (opt-in, small cards) shrink them so
+// the VRAM goes to a larger prompt chunk: every Gemm path already dequantizes a weight that does not fit in row blocks
+// (`rows = scratch_elems_ / K`), so a smaller scratch means more, smaller GEMM calls - the same values.
+int64_t gemm_scratch_elems() {
+    static const int64_t v = [] {
+        const char* e = std::getenv("STRATA_PF_GEMM_SCRATCH_MIB");
+        const int64_t mib = e != nullptr ? std::clamp<int64_t>(std::atoll(e), 8, 64) : 64;
+        return mib << 19;   // FP16 elements in that many MiB
+    }();
+    return v;
+}
+size_t gemm_ws_bytes() {
+    static const size_t v = [] {
+        const char* e = std::getenv("STRATA_PF_GEMM_WS_MIB");
+        return (size_t) (e != nullptr ? std::clamp<int64_t>(std::atoll(e), 1, 32) : 32) << 20;
+    }();
+    return v;
+}
+#define GEMM_SCRATCH gemm_scratch_elems()
+#define GEMM_WS gemm_ws_bytes()
 
 // THE ATTENTION HALF AND THE MoE HALF SHARE THEIR BUFFERS.  A layer runs its attention (GDN or QSA), writes it back
 // into the residual, and only then its MoE, so the three sets of scratch are never live at once: one region the size

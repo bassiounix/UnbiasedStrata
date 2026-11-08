@@ -5268,7 +5268,6 @@ int main(int argc, char** argv) {
                         : o.batch > 0 ? "it does not support --batch"
                         : o.pipeline_windows > 0 ? "it does not support --pipeline-windows"
                         : o.short_read > 0 ? "it needs --short-read 0"
-                        : !o.mtp.empty() ? "it does not support --mtp (the draft head copies the head's rows)"
                         : o.prefill_chunk <= 0 ? "it needs --prefill CHUNK"
                         : nullptr;
         if (why != nullptr) {
