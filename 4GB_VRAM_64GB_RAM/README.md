@@ -71,7 +71,7 @@ make build CUDA_ARCHS=86                      # your GPU's compute capability, w
 # 3: the model (~76 GB download) -> ~/dev/models/swift-iq3_xxs
 ./4GB_VRAM_64GB_RAM/prepare-model.sh
 
-# 4: the tools on the PATH (+ the root helper for retraining the PCIe link)
+# 4: the tools on the PATH (+ the root helpers that keep the PCIe link at full speed)
 ./4GB_VRAM_64GB_RAM/install.sh --system
 
 # 5: if the GPU was set up for VM passthrough: give it to the host, reboot
@@ -194,7 +194,7 @@ is part of the repository.
 
 ```bash
 ./4GB_VRAM_64GB_RAM/install.sh                 # user part only
-./4GB_VRAM_64GB_RAM/install.sh --system        # also the root helper for retraining the PCIe link (asks for sudo)
+./4GB_VRAM_64GB_RAM/install.sh --system        # also the root helpers for the PCIe link (asks for sudo)
 ./4GB_VRAM_64GB_RAM/install.sh --model-dir /data/swift-iq3_xxs --force-config   # another model directory
 ```
 
@@ -202,13 +202,15 @@ What it puts where:
 
 | Path | What |
 |---|---|
-| `~/.local/bin/strata-agent` | the launcher: the measured configuration, a PCIe check at start and a watch on the link while serving |
-| `~/.local/bin/gpu-mode` | who owns the GPU at boot (host / VM), status, PCIe link retrain |
+| `~/.local/bin/strata-agent` | the launcher: the measured configuration, the GPU held at full power while serving, a PCIe check at start and a watch on the link |
+| `~/.local/bin/gpu-mode` | who owns the GPU at boot (host / VM), status, holding the GPU at full power, PCIe link retrain |
 | `~/.local/share/gpu-mode/pcie-probe` (+ `.cu`) | 4-second host-to-GPU bandwidth probe, built with nvcc for your GPU |
 | `~/.config/strata-agent.conf` | `REPO=` and `MODEL_DIR=` (plus commented defaults: HOST, PORT, CONTEXT, CHUNK, VISION, VISION_THREADS) |
 | `~/.config/gpu-mode.conf` | `GPU=` (PCI address) and `VFIO_IDS=` (every function of the GPU's slot), detected with `lspci` |
 | `/usr/local/sbin/gpu-link-retrain` | `--system` only: root-owned script that retrains the GPU's PCIe port; no input, no config |
 | `/etc/sudoers.d/gpu-link-retrain` | `--system` only: `<you> ALL=(root) NOPASSWD: /usr/local/sbin/gpu-link-retrain` |
+| `/usr/local/sbin/gpu-pcie-hold` | `--system` only: root-owned, `on` locks the GPU's memory clock at its maximum (`nvidia-smi --lock-memory-clocks`), `off` resets it; takes nothing else |
+| `/etc/sudoers.d/gpu-pcie-hold` | `--system` only: `<you> ALL=(root) NOPASSWD: /usr/local/sbin/gpu-pcie-hold on, /usr/local/sbin/gpu-pcie-hold off` |
 
 `~/.local/bin` must be on the PATH (`install.sh` says so if it is not). Existing config files are kept unless
 `--force-config` is given. Check `~/.config/gpu-mode.conf` against `lspci -nn`: on the laptop it is
@@ -245,7 +247,8 @@ gpu-mode status              this boot, the next boot, driver, PCIe link, power 
 gpu-mode host                next boot: the NVIDIA driver takes the GPU at boot (full speed, HDMI works)
 gpu-mode vm                  next boot: vfio-pci claims the GPU at boot, for passing it to a VM
 gpu-mode host|vm --dry-run   show the edits without writing anything
-gpu-mode retrain             the PCIe link is stuck at Gen 1 under load: retrain the GPU's port at full speed
+gpu-mode hold on|off         hold the GPU at full power now, so the driver never lowers the PCIe link (or release)
+gpu-mode retrain [--force]   the PCIe link is stuck at Gen 1 under load: retrain the GPU's port (can crash the GPU)
 ```
 
 `host` and `vm` move exactly two things (and take sudo for it):
@@ -260,7 +263,7 @@ gpu-mode retrain             the PCIe link is stuck at Gen 1 under load: retrain
 Everything else (IOMMU arguments, `nvidia-drm.modeset=1`, the initramfs, Looking Glass, the libvirt VM) stays, so a
 VM can be used again after `gpu-mode vm && sudo reboot`. Backups of the two files are written as
 `*.gpu-mode-<timestamp>`. `gpu-mode` is written for Fedora (BLS boot entries, `grubby`); on another distribution only
-`status` and `retrain` apply as they are.
+`status`, `hold` and `retrain` apply as they are.
 
 ```bash
 gpu-mode host --dry-run      # read what it will change
@@ -316,7 +319,7 @@ per request. One request is served at a time.
 Settings: `~/.config/strata-agent.conf`, or the same names in the environment for one run, e.g.
 `PORT=8080 strata-agent`, `VISION=0 strata-agent`, `PIN_EXPERTS=0 strata-agent`, `CHUNK=2048 strata-agent`. The
 settings are REPO, MODEL_DIR, HOST, PORT, CONTEXT (262144), CHUNK (4096), PIN_EXPERTS (1), VISION (1),
-VISION_THREADS (12), WATCH_LINK (1) and AUTO_RETRAIN (0). Extra arguments are
+VISION_THREADS (12), HOLD_LINK (1), WATCH_LINK (1) and AUTO_RETRAIN (0). Extra arguments are
 passed to the engine. What every engine option and variable in the launcher does is commented in
 [bin/strata-agent](bin/strata-agent) and explained in [How the configuration was found](#how-the-configuration-was-found).
 
@@ -374,58 +377,70 @@ and every prompt chunk moves a large share of them to the GPU.
 
 **Symptom:** prompt reading ~77 tok/s instead of ~460-480 (with the earlier 768-token chunks: ~35-40 instead of
 ~180), and the head and projections take ~2.3 s instead of ~0.17 s to be written back after each prompt; `strata-agent` or the engine prints a PCIe probe of
-~1 GB/s instead of ~13; `nvidia-smi --query-gpu=pcie.link.gen.current` stays at 1 *under load* (at idle it is
-always 1 - that is normal power saving).
+~1 GB/s instead of ~13; `nvidia-smi --query-gpu=pcie.link.gen.current` stays at 1 *under load*.
 
-**What was found:**
+**Cause:** the link trains at 16 GT/s x8 at boot (kernel log: `126.024 Gb/s available PCIe bandwidth, limited by
+16.0 GT/s PCIe x8 link`). The NVIDIA driver then lowers it to Gen 1 every time the GPU goes idle (performance state
+P8) and raises it again when work arrives (P0). Now and then the raise fails and the link stays at 2.5 GT/s
+(~0.9-1.7 GB/s), even at P0 and 100% load, until a retrain or a reboot. Without a fix that happened every 5 to 50
+minutes of use. When it was stuck, both ends were set to target 16 GT/s (`lspci -vvv`: `LnkCtl2: Target Link Speed:
+16GT/s` on `00:01.0` and `01:00.0`). There were no link errors (0 replays), no throttling, and the power and
+temperatures were normal.
 
-- The link trains at 16 GT/s x8 at boot (kernel log: `126.024 Gb/s available PCIe bandwidth, limited by 16.0 GT/s
-  PCIe x8 link`). The NVIDIA driver then lowers it when idle and raises it under load - but sometimes it lowers it and
-  never raises it again, even at P0 and 100% load: the link stays at 2.5 GT/s, ~0.9-1.7 GB/s.
-- Both ends were set to target 16 GT/s when it was stuck (`lspci -vvv`: `LnkCtl2: Target Link Speed: 16GT/s` on
-  `00:01.0` and `01:00.0`, `LnkSta: ... (downgraded)`), there were no link errors (`nvidia-smi -q`: 0 replays), no
-  throttling (clock event reason counters at 0), AC power, normal temperatures.
-- It happened after the vfio-pci to NVIDIA runtime handoff, once right after a boot, once a few minutes after a boot
-  with the GPU idle, and twice in the middle of heavy benchmark runs; between those it stayed fine for hours.
-- **Ruled out:** runtime power-off of the GPU (D3cold): it also happened with `power/control=on` and no power-off
-  since boot; NVIDIA persistence mode (`nvidia-smi -pm 1`): it happened with it on too; battery; link errors; the
-  kernel's thermal zones (the `PCIe_Port_Link_Speed_*` cooling devices' `cur_state` only mirrors the current speed).
-  The trigger is not known.
+**Ruled out:**
+- The kernel: none of the thermal zones is bound to the port's `PCIe_Port_Link_Speed_0000:00:01.0` cooling device,
+  and the kernel's link-speed quirk never touched `00:01.0`.
+- Runtime power-off of the GPU (D3cold).
+- NVIDIA persistence mode, battery power and link errors.
+- The driver setting `NVreg_RegistryDwords="RMPcieLinkSpeed=0x80000015"` (Gen 2-4 allowed, "lock at load"; the
+  fields come from NVIDIA's `nvrm_registry.h`). It loaded, but the GPU still went to P8 and Gen 1 at idle.
 
-**Fix:** retrain the link. Writing 0 to the GPU port's PCIe link-speed cooling device makes the kernel's bandwidth
-controller (Linux 6.13+) set the target to full speed and retrain; after that the driver's own up/down switching works
-again until the next time:
+**Fix: hold the GPU at full power while serving.** The link only drops when the GPU drops to P8, and the memory clock
+decides that state. With the memory clock locked at its maximum (`nvidia-smi --lock-memory-clocks=6001,6001`, which
+needs root), the GPU stays at P0 when idle and the link stays at Gen 4. `strata-agent` does this when it starts
+(`HOLD_LINK=1`, the default) through the root helper `/usr/local/sbin/gpu-pcie-hold` (installed by
+`install.sh --system` and allowed without a password for exactly `on` and `off`). It releases the hold when it exits,
+including on Ctrl-C, `kill` and a closed terminal. Only `kill -9` leaves the hold on; `gpu-mode hold off` releases it.
+By hand:
 
 ```bash
-gpu-mode retrain                                  # asks for sudo, or uses the helper without a password
+gpu-mode hold on        # the GPU stays at P0 and Gen 4 while idle (~12.5 W idle instead of ~6-9 W)
+gpu-mode status         # held: yes (P0, memory clock 6001 of 6001 MHz)
+gpu-mode hold off       # normal power saving again
+```
+
+Measured 2026-11-08 at 262K context with the hold (1-second `nvidia-smi` samples over 18.5 minutes of agent
+sessions, with idle gaps of 20-70 s and of 3 minutes):
+
+- The link was at Gen 4 in 1,105 of 1,117 samples. The other 12 were single-second dips to Gen 1 during prompt reading at
+  the 60 W power cap (each when the power briefly fell from ~58 to ~45-50 W), and every one was back at Gen 4 the
+  next second.
+- The link never got stuck, the watcher gave no warnings, and every cold 25K read ran at 466-482 tok/s.
+- Without the hold, the link dropped to Gen 1 between every pair of requests.
+
+**Retraining** (only if the link is stuck anyway). Writing 0 to the GPU port's PCIe link-speed cooling device makes
+the kernel's bandwidth controller (Linux 6.13+) retrain the link at full speed:
+
+```bash
+gpu-mode retrain                                  # warns and asks first; --force skips the question
 sudo -n /usr/local/sbin/gpu-link-retrain          # the helper (install.sh --system)
 ~/.local/share/gpu-mode/pcie-probe                # ~13 again
 ```
 
-The write sometimes reports `Resource temporarily unavailable` or blocks for a while; the retrain happens anyway
-(both are handled).
-
-**A retrain is not always safe.** It worked about ten times - idle, and three times in the middle of a request with
-the answer unaffected - but once the bandwidth probe that ran right after a retrain made the GPU fall off the bus
-(kernel: `NVRM: Xid (PCI:0000:01:00): 79, pid=..., name=pcie-probe, GPU has fallen off the bus`, then `Xid 154,
-GPU recovery action changed ... (PF FLR)`; `nvidia-smi`: `Unable to determine the device handle for GPU0`). Only a
-reboot brings it back. So retraining is your decision, made between requests, not something done behind your back.
+**A retrain can crash the GPU.** Of about ten retrains, two made the GPU fall off the bus within a second (kernel:
+`NVRM: Xid (PCI:0000:01:00): 79, ... GPU has fallen off the bus`, then `Xid 154 ... (PF FLR)`; `nvidia-smi`:
+`Unable to determine the device handle for GPU0`). Only a reboot brings it back. So stop the engine first. If the GPU
+is held, a reboot is the safer way out.
 
 **How strata-agent deals with it:**
 
-- **At start** (4 s): it measures the link with `pcie-probe`. Under 5 GB/s it warns and tells you to run
-  `gpu-mode retrain` and start again.
-- **While serving**: it watches `nvidia-smi` every 2 s (GPU utilization and link generation; nothing is done to the
-  GPU) and warns when the GPU is busy (10% or more) but the link stays at Gen 1 for 5 samples in a row. On a healthy
-  link every busy sample was at Gen 4 (144 of 144, prompt reading and decoding), and idle samples at Gen 1 are
-  normal power saving, so they are ignored. `WATCH_LINK=0` turns it off.
-- **`AUTO_RETRAIN=1`** (environment or `~/.config/strata-agent.conf`, needs `install.sh --system`) lets it retrain by
-  itself: at start (then it waits 5 s before measuring again) and while serving, at most once every 5 minutes. Off
-  by default because of the crash above.
-
-How often it happens: on 2026-11-08, after the vfio handoff, once right after boot, once a few minutes after boot,
-in the afternoon several times within a minute of a healthy start (one run read at 41 tok/s although the start
-measured 13 GB/s), and twice more during later runs, once in the middle of plain decoding.
+- **At start:** it holds the GPU (`HOLD_LINK=1`; it says so, or says why it could not). Then it measures the link
+  with `pcie-probe` (4 s). Under 5 GB/s it warns.
+- **While serving:** it reads `nvidia-smi` every 2 s (GPU utilization and link generation; it changes nothing on the
+  GPU). It warns when the link stays at Gen 1 for 5 samples in a row while the GPU is busy (10% or more) or held.
+  `WATCH_LINK=0` turns this off.
+- **`AUTO_RETRAIN=1`** (needs `install.sh --system`) lets it retrain by itself: at start (then it waits 5 s and
+  measures again), and while serving at most once every 5 minutes. Off by default because of the crashes above.
 
 ## How the configuration was found
 
@@ -603,9 +618,10 @@ engine command from [Step 6](#step-6---run) by hand, without `STRATA_PREFILL_IN_
 
 `strata-agent` serves the full 262,144-token window by default. With `STRATA_PREFILL_IN_DENSE=1` and page-locked experts
 it fits with the same 4096-token chunks as 128K (no step-down): 212 MiB of VRAM free at rest (220 at 128K), 2.13 GiB of
-pinned RAM for the K/V (1.06 GiB at 128K, ~44 GiB page-locked in all), ready in 64 s, answers coherent. Its prompt-reading
-speed on long prompts is not measured yet (the link was stuck at Gen 1 during that test); every speed in this README
-was measured at 128K. To run at 128K (a little more VRAM and RAM to spare, a faster start):
+pinned RAM for the K/V (1.06 GiB at 128K, ~44 GiB page-locked in all), ready in 58-64 s, answers coherent. Its speed
+is the same as at 128K. Measured 2026-11-08 with the GPU held: `bench.py agent` six times gave a cold 25K read at
+466-482 tok/s, ~3K-token agent turns at 380-400 tok/s and decode mostly at 17-20 tok/s (13.4-22.0). A fresh 7K prompt read at
+480 tok/s. To run at 128K (a little more VRAM and RAM to spare, a faster start):
 
 ```bash
 CONTEXT=131072 strata-agent
@@ -625,8 +641,10 @@ indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 2
 | `verify: instantiate: out of memory` at the first answer | less than ~55-60 MiB free after loading | a smaller chunk, drafting off, no external screen on the NVIDIA GPU |
 | `device buffers for a chunk of N tokens do not fit` and a smaller chunk | the chunk is too big for the free VRAM (e.g. an external screen on the NVIDIA GPU); the engine steps down (4096 -> 3072 -> 2048 ...) | free the VRAM, or set the CHUNK that fits |
 | `*** strata-agent: the experts could not be page-locked` | less RAM free than ~44 GiB: the engine fell back to ordinary RAM | close memory-heavy programs and restart (~20% faster prompts), or `PIN_EXPERTS=0` to skip the attempt |
-| prompt reading ~77 tok/s (or ~35-40 with 768-token chunks), probe ~1 GB/s | the PCIe link is stuck | `gpu-mode retrain`, restart `strata-agent` ([details](#the-pcie-link-problem)) |
-| `nvidia-smi`: `Unable to determine the device handle for GPU0 ... Unknown Error`; kernel `NVRM: Xid ... 79, GPU has fallen off the bus` | the GPU crashed (seen once, right after a link retrain) | reboot; then check `gpu-mode status` and the probe |
+| prompt reading ~77 tok/s (or ~35-40 with 768-token chunks), probe ~1 GB/s | the PCIe link is stuck | check that `strata-agent` printed `GPU held at full power` (else `install.sh --system`); restart it; `gpu-mode retrain` only as a last resort ([details](#the-pcie-link-problem)) |
+| `strata-agent: could not hold the GPU at full power` | `/usr/local/sbin/gpu-pcie-hold` or its sudoers entry is missing | `install.sh --system` |
+| `gpu-mode status` says `held: yes` with no engine running (idle GPU at ~12.5 W instead of ~6) | `strata-agent` was killed with `kill -9` and could not release the hold | `gpu-mode hold off` |
+| `nvidia-smi`: `Unable to determine the device handle for GPU0 ... Unknown Error`; kernel `NVRM: Xid ... 79, GPU has fallen off the bus` | the GPU crashed (seen twice, each within a second of a link retrain) | reboot; then check `gpu-mode status` and the probe |
 | `the whole resident RAM mode does not fit` | less than ~44 GiB available at start; part of the experts is then read from disk | close memory-heavy programs; the engine counts page cache only if the kernel's `MemAvailable` does |
 | the same, inside a container or an app sandbox | a cgroup memory limit counts the page cache of the model files the process read | drop those files' cache before starting (the snippet below) or raise the limit |
 | GPU at 20 W, link at Gen 2 | on battery | plug in the charger |
@@ -649,7 +667,9 @@ for f in glob.glob(M + '/*.gguf') + [M + '/pack/dense.bin']:
 gpu-mode vm && sudo reboot                  # back to the VFIO passthrough setup (only if you used gpu-mode host)
 rm ~/.local/bin/strata-agent ~/.local/bin/gpu-mode ~/.config/strata-agent.conf ~/.config/gpu-mode.conf
 rm -r ~/.local/share/gpu-mode
+gpu-mode hold off                           # if strata-agent was killed while holding the GPU
 sudo rm /usr/local/sbin/gpu-link-retrain /etc/sudoers.d/gpu-link-retrain
+sudo rm /usr/local/sbin/gpu-pcie-hold /etc/sudoers.d/gpu-pcie-hold
 rm -r ~/dev/models/swift-iq3_xxs            # the links, pack and MTP files (the GGUFs stay in ~/.cache/huggingface)
 hf cache delete                             # interactive; or remove ~/.cache/huggingface/hub/models--SC117--Swift-1.5-*
 ```
@@ -662,10 +682,12 @@ hf cache delete                             # interactive; or remove ~/.cache/hu
 |---|---|
 | `README.md` | this guide |
 | `prepare-model.sh` | download from Hugging Face, link, build `pack/` and `mtp/rt/` |
-| `install.sh` | put the tools on the PATH, write their settings, build the probe, `--system`: the root helper |
+| `install.sh` | put the tools on the PATH, write their settings, build the probe, `--system`: the root helpers |
 | `bin/strata-agent` | the launcher |
-| `bin/gpu-mode` | host/VM GPU ownership, status, PCIe retrain |
+| `bin/gpu-mode` | host/VM GPU ownership, status, holding the GPU at full power, PCIe retrain |
 | `system/gpu-link-retrain.in` | the root helper (install.sh fills in the PCIe port) |
 | `system/sudoers-gpu-link-retrain.in` | its sudoers line (install.sh fills in the user) |
+| `system/gpu-pcie-hold.in` | the root helper that holds the GPU at full power (install.sh fills in the GPU) |
+| `system/sudoers-gpu-pcie-hold.in` | its sudoers line, `on` and `off` only (install.sh fills in the user) |
 | `tools/pcie-probe.cu` | the bandwidth probe |
 | `bench/bench.py` | the benchmark (agent session, context sweep) |

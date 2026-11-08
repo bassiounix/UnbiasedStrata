@@ -12,6 +12,8 @@
 # With --system (asks for sudo):
 #   /usr/local/sbin/gpu-link-retrain     root-owned, retrains the GPU's PCIe port, takes no input
 #   /etc/sudoers.d/gpu-link-retrain      lets your user run exactly that helper without a password
+#   /usr/local/sbin/gpu-pcie-hold        root-owned, `on`/`off`: holds the GPU's memory clock (and so the link) at full
+#   /etc/sudoers.d/gpu-pcie-hold         lets your user run exactly `gpu-pcie-hold on|off` without a password
 set -euo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -23,7 +25,7 @@ while [[ $# -gt 0 ]]; do
         --model-dir) MODEL_DIR=$2; shift ;;
         --system) SYSTEM=1 ;;
         --force-config) FORCE_CONFIG=1 ;;
-        -h|--help) sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,16p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "install: unknown option $1" >&2; exit 2 ;;
     esac
     shift
@@ -47,9 +49,11 @@ MODEL_DIR=$MODEL_DIR
 #PIN_EXPERTS=1
 #VISION=1
 #VISION_THREADS=12
+# hold the GPU at full power while serving (needs install.sh --system), so the driver never lowers the PCIe link
+#HOLD_LINK=1
 # watch the PCIe link while serving and warn when it drops to Gen 1 (reads nvidia-smi only)
 #WATCH_LINK=1
-# 1 = retrain a stuck link by itself through the root helper (install.sh --system). Off by default: a retrain once
+# 1 = retrain a stuck link by itself through the root helper (install.sh --system). Off by default: a retrain twice
 # made the GPU fall off the bus (a reboot to recover)
 #AUTO_RETRAIN=0
 EOF
@@ -98,11 +102,17 @@ if [[ $SYSTEM == 1 ]]; then
     t=$(mktemp -d)
     sed -e "s|@PORT@|$PORT|g" -e "s|@GPU@|$GPU|g" "$HERE/system/gpu-link-retrain.in" > "$t/gpu-link-retrain"
     sed -e "s|@USER@|$(id -un)|g" "$HERE/system/sudoers-gpu-link-retrain.in" > "$t/sudoers"
+    sed -e "s|@GPU@|$GPU|g" "$HERE/system/gpu-pcie-hold.in" > "$t/gpu-pcie-hold"
+    sed -e "s|@USER@|$(id -un)|g" "$HERE/system/sudoers-gpu-pcie-hold.in" > "$t/sudoers-hold"
+    visudo -cqf "$t/sudoers" && visudo -cqf "$t/sudoers-hold" || { echo "install: sudoers check failed" >&2; exit 1; }
     sudo install -o root -g root -m 755 "$t/gpu-link-retrain" /usr/local/sbin/gpu-link-retrain
+    sudo install -o root -g root -m 755 "$t/gpu-pcie-hold" /usr/local/sbin/gpu-pcie-hold
     sudo install -o root -g root -m 440 "$t/sudoers" /etc/sudoers.d/gpu-link-retrain
+    sudo install -o root -g root -m 440 "$t/sudoers-hold" /etc/sudoers.d/gpu-pcie-hold
     sudo visudo -cf /etc/sudoers.d/gpu-link-retrain
+    sudo visudo -cf /etc/sudoers.d/gpu-pcie-hold
     rm -rf "$t"
-    echo "install: /usr/local/sbin/gpu-link-retrain (port $PORT) and /etc/sudoers.d/gpu-link-retrain"
+    echo "install: /usr/local/sbin/gpu-link-retrain (port $PORT), /usr/local/sbin/gpu-pcie-hold (GPU $GPU) and their sudoers entries"
 fi
 
 case ":$PATH:" in

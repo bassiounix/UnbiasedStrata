@@ -5,7 +5,8 @@
 #   gpu-mode host                next boot: the NVIDIA driver takes the GPU at boot (full speed, HDMI works)
 #   gpu-mode vm                  next boot: vfio-pci claims the GPU at boot, for passing it to a VM
 #   gpu-mode host|vm --dry-run   show the edits without writing anything
-#   gpu-mode retrain             the PCIe link is stuck at Gen 1 under load: retrain the GPU's port at full speed
+#   gpu-mode hold on|off         hold the GPU at full power now, so the driver never lowers the PCIe link (or release)
+#   gpu-mode retrain [--force]   the PCIe link is stuck at Gen 1 under load: retrain the GPU's port (can crash the GPU)
 #
 # Fedora (BLS boot entries, grubby, /etc/kernel/cmdline).  Only the two vfio boot arguments move:
 #   rd.driver.pre=vfio-pci  vfio-pci.ids=<the GPU's functions>
@@ -44,6 +45,7 @@ RULE=/etc/udev/rules.d/61-mutter-ignore-nvidia.rules
 RULE_OFF=$RULE.gpu-mode-off
 RULE_TEXT='ACTION=="add|change", SUBSYSTEM=="drm", KERNEL=="card[0-9]*", SUBSYSTEMS=="pci", ATTRS{vendor}=="0x10de", TAG+="mutter-device-ignore"'
 HELPER=/usr/local/sbin/gpu-link-retrain
+HOLD=/usr/local/sbin/gpu-pcie-hold
 
 strip_args() {   # the argument string without the vfio arguments, single-spaced
     local s=" $1 " a
@@ -64,7 +66,9 @@ status() {
     echo "PCIe link:  $(cat /sys/bus/pci/devices/$GPU/current_link_speed) x$(cat /sys/bus/pci/devices/$GPU/current_link_width) (card max $(cat /sys/bus/pci/devices/$GPU/max_link_speed))"
     if [[ $drv == nvidia ]] && command -v nvidia-smi >/dev/null; then
         echo "NVIDIA:     $(nvidia-smi --query-gpu=pcie.link.gen.current,pcie.link.gen.max --format=csv,noheader \
-            | awk -F', ' '{print "gen " $1 " now, gen " $2 " max (idle shows gen 1; under load it should reach the max)"}')"
+            | awk -F', ' '{print "gen " $1 " now, gen " $2 " max (idle shows gen 1 unless held; under load the max)"}')"
+        echo "held:       $(nvidia-smi --query-gpu=pstate,clocks.mem,clocks.max.memory --format=csv,noheader,nounits \
+            | awk -F', ' '{ print ($2 == $3 ? "yes" : "no") " (" $1 ", memory clock " $2 " of " $3 " MHz)" }')"
         echo "power cap:  $(nvidia-smi --query-gpu=enforced.power.limit,power.default_limit --format=csv,noheader | sed 's/, / of /')"
     fi
     if [[ -e $RULE ]]; then echo "GNOME:      ignores the NVIDIA GPU (ports wired to it stay dark) - $RULE"
@@ -114,12 +118,31 @@ switch() {
     grubby --info=DEFAULT | grep '^args=' | sed 's/^/default kernel /'
 }
 
+hold() {
+    # The driver lowers the link to Gen 1 whenever the GPU idles (P8) and raises it under load; the raise sometimes
+    # fails and the link stays at Gen 1.  Holding the memory clock at its maximum keeps the GPU out of P8, so the link
+    # is never lowered.  Costs idle power while held; strata-agent holds it only while it serves.
+    local want=${1:-}
+    [[ $want == on || $want == off ]] || { echo "usage: gpu-mode hold on|off" >&2; exit 2; }
+    [[ -x $HOLD ]] || { echo "gpu-mode: $HOLD is not installed (install.sh --system)" >&2; exit 1; }
+    sudo "$HOLD" "$want"
+}
+
 retrain() {
     # Seen on an RTX 3050 Ti laptop: the NVIDIA driver sometimes drops the link to Gen 1 and never raises it again,
     # even at P0 with both ends set to target 16 GT/s (0 replays, no throttling).  Setting the port's PCIe link-speed
     # cooling device to state 0 makes the kernel retrain the link at full speed; the driver's own switching then works
     # again until the next drop.  The write can block or report an error; the retrain usually happens anyway.
     # The root-owned helper (install.sh --system) does the same without a password.
+    # Twice (of about ten) the GPU fell off the bus within a second of a retrain (NVRM Xid 79): only a reboot recovers
+    # it, so ask first.  Holding the GPU (gpu-mode hold on, which strata-agent does) keeps the link from dropping.
+    if [[ ${1:-} != --force ]]; then
+        echo "gpu-mode: a retrain made the GPU fall off the bus twice in about ten tries (Xid 79, a reboot to recover)."
+        echo "  Stop anything using the GPU first. strata-agent holds the GPU at full power so the link does not drop."
+        local ans=""
+        [[ -t 0 ]] && read -r -p "retrain anyway? [y/N] " ans
+        [[ $ans == [yY]* ]] || { echo "gpu-mode: not retrained (gpu-mode retrain --force skips this question)"; exit 1; }
+    fi
     [[ $EUID -ne 0 && -x $HELPER ]] && exec sudo "$HELPER"
     local port cdev="" c
     port=$(basename "$(readlink -f /sys/bus/pci/devices/$GPU/..)")
@@ -127,7 +150,7 @@ retrain() {
         [[ $(cat "$c/type" 2>/dev/null) == "PCIe_Port_Link_Speed_$port" ]] && cdev=$c
     done
     [[ -n $cdev ]] || { echo "gpu-mode: no PCIe link-speed cooling device for port $port (kernel >= 6.13 needed)" >&2; exit 1; }
-    [[ $EUID -eq 0 ]] || exec sudo "$0" retrain
+    [[ $EUID -eq 0 ]] || exec sudo "$0" retrain --force
     echo "retraining $port ($cdev)..."
     timeout 10 sh -c "echo 0 > $cdev/cur_state" 2>/dev/null \
         || echo "(the kernel reported an error or timed out; the retrain usually happened anyway - check it under load)"
@@ -137,6 +160,7 @@ retrain() {
 case "${1:-status}" in
     status) status ;;
     host|vm) switch "$1" "$([[ ${2:-} == --dry-run ]] && echo 1 || echo 0)" ;;
-    retrain) retrain ;;
-    *) sed -n '2,9p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+    hold) hold "${2:-}" ;;
+    retrain) retrain "${2:-}" ;;
+    *) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
 esac

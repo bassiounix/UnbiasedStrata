@@ -6,20 +6,23 @@
 #   cold 25K-token system prompt 462-478 tok/s (52-54 s), ~3K-token agent turns ~390 tok/s (7.6-8 s), decode ~17-19
 #   tok/s; a repeated system prompt is reused from the cache (a new conversation reads only its new tokens).
 #   (The earlier 768-token chunks with pageable experts: 180 tok/s cold, 160-168 tok/s turns, the same decode.)
-#   Those speeds were measured at 128K context.  At 262K the 4096-token chunk still fits: 212 MiB of VRAM free at rest
-#   (220 at 128K), the K/V in 2.13 GiB of pinned RAM (1.06), ~44 GiB of RAM page-locked in all, ready in ~64 s.
+#   The same speeds at 262K (cold 466-482, turns 380-400, measured with the GPU held): the 4096-token chunk still fits,
+#   212 MiB of VRAM free at rest (220 at 128K), the K/V in 2.13 GiB of pinned RAM (1.06), ~44 GiB page-locked in all,
+#   ready in ~60 s.
 #   CONTEXT=131072 halves the K/V's RAM.
 #
-# The PCIe link: the NVIDIA driver sometimes leaves it stuck at Gen 1 (~1 GB/s instead of ~13; prompt reading ~4x
-# slower).  Before loading anything strata-agent measures it (pcie-probe), and while serving it watches for the stuck
-# state (GPU busy but the link at Gen 1 for 10 s, read from nvidia-smi - nothing on the GPU is touched).  Either way it
-# tells you; retraining the link is your call (`gpu-mode retrain`), because a retrain once made the GPU fall off the
-# bus (NVRM Xid 79, a reboot to recover).  AUTO_RETRAIN=1 lets it retrain by itself through the root helper
-# (install.sh --system) - at startup, and while serving at most once every 5 minutes.
+# The PCIe link: the NVIDIA driver lowers it to Gen 1 whenever the GPU idles (P8) and raises it again under load; now
+# and then the raise fails and the link stays at Gen 1 (~1 GB/s instead of ~13; prompt reading ~4x slower).  So while
+# it serves, strata-agent holds the GPU at full power (HOLD_LINK=1: the memory clock locked at its maximum through the
+# root helper gpu-pcie-hold from install.sh --system; ~6 W more at idle) and the link never drops; it releases the hold
+# on exit.  It also measures the link before loading anything (pcie-probe) and watches it while serving (nvidia-smi
+# only), and tells you if it is stuck.  Retraining is your call (`gpu-mode retrain`): twice a retrain made the GPU fall
+# off the bus (NVRM Xid 79, a reboot to recover).  AUTO_RETRAIN=1 lets it retrain by itself through the root helper
+# gpu-link-retrain - at startup, and while serving at most once every 5 minutes.
 #
 # Settings: ~/.config/strata-agent.conf (written by install.sh); any of them can be overridden from the environment:
 #   REPO=~/dev/UnbiasedStrata  MODEL_DIR=~/dev/models/swift-iq3_xxs  HOST=127.0.0.1  PORT=18090
-#   CONTEXT=262144  CHUNK=4096  PIN_EXPERTS=1  VISION=1  VISION_THREADS=12  WATCH_LINK=1  AUTO_RETRAIN=0
+#   CONTEXT=262144  CHUNK=4096  PIN_EXPERTS=1  VISION=1  VISION_THREADS=12  HOLD_LINK=1  WATCH_LINK=1  AUTO_RETRAIN=0
 # Extra arguments go to the engine (after the front end's `--`).
 set -uo pipefail
 
@@ -27,6 +30,7 @@ CONF=${STRATA_AGENT_CONF:-$HOME/.config/strata-agent.conf}
 _env_REPO=${REPO-}; _env_MODEL_DIR=${MODEL_DIR-}; _env_HOST=${HOST-}; _env_PORT=${PORT-}; _env_CONTEXT=${CONTEXT-}
 _env_CHUNK=${CHUNK-}; _env_VISION=${VISION-}; _env_VISION_THREADS=${VISION_THREADS-}
 _env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}; _env_PIN_EXPERTS=${PIN_EXPERTS-}
+_env_HOLD_LINK=${HOLD_LINK-}
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
 REPO=${_env_REPO:-${REPO:-$HOME/dev/UnbiasedStrata}}
@@ -40,7 +44,9 @@ VISION=${_env_VISION:-${VISION:-1}}
 VISION_THREADS=${_env_VISION_THREADS:-${VISION_THREADS:-12}}
 WATCH_LINK=${_env_WATCH_LINK:-${WATCH_LINK:-1}}
 AUTO_RETRAIN=${_env_AUTO_RETRAIN:-${AUTO_RETRAIN:-0}}
+HOLD_LINK=${_env_HOLD_LINK:-${HOLD_LINK:-1}}
 HELPER=/usr/local/sbin/gpu-link-retrain
+HOLD=/usr/local/sbin/gpu-pcie-hold
 
 # the model files: flat (prepare-model.sh's layout) or as `hf download --local-dir` leaves them (IQ3_XXS/)
 SH1=$(ls "$MODEL_DIR"/Swift-*-IQ3_XXS-00001-of-00002.gguf "$MODEL_DIR"/IQ3_XXS/Swift-*-IQ3_XXS-00001-of-00002.gguf 2>/dev/null | head -1)
@@ -51,6 +57,32 @@ MMPROJ=$(ls "$MODEL_DIR"/mmproj-*.gguf 2>/dev/null | head -1)
 
 cat /sys/class/power_supply/ADP*/online /sys/class/power_supply/AC*/online 2>/dev/null | head -1 | grep -q '^0$' &&
     echo "strata-agent: WARNING: on battery - the GPU is capped (20 W on the 3050 Ti laptop) and the PCIe link stays slow" >&2
+
+# ---- cleanup on every way out (Ctrl-C, kill, a closed terminal, exit): stop the link watcher, release the hold.
+# Background jobs of a script ignore Ctrl-C, so they are stopped here.
+WATCH_PIDS=(); WDIR=""; HELD=0; CLEANED=0
+cleanup() {
+    (( CLEANED )) && return
+    CLEANED=1
+    (( ${#WATCH_PIDS[@]} )) && kill "${WATCH_PIDS[@]}" 2>/dev/null
+    [[ -n $WDIR ]] && rm -rf "$WDIR"
+    (( HELD )) && sudo -n "$HOLD" off >/dev/null 2>&1
+}
+trap cleanup EXIT
+trap 'cleanup; trap - INT; kill -INT $$' INT
+trap 'cleanup; exit 143' TERM
+trap 'cleanup; exit 129' HUP
+
+# ---- hold the GPU at full power while serving, so the driver never lowers the link (and never fails to raise it)
+if [[ $HOLD_LINK == 1 ]]; then
+    if [[ -x $HOLD ]] && sudo -n "$HOLD" on >/dev/null 2>&1; then
+        HELD=1
+        echo "strata-agent: GPU held at full power while serving (the PCIe link stays at full speed; released on exit)" >&2
+    else
+        echo "strata-agent: could not hold the GPU at full power ($HOLD from install.sh --system):" \
+             "the link may drop to Gen 1 between requests" >&2
+    fi
+fi
 
 PROBE=$HOME/.local/share/gpu-mode/pcie-probe
 if [[ -x $PROBE ]]; then
@@ -71,13 +103,14 @@ if [[ -x $PROBE ]]; then
     echo "strata-agent: PCIe host->GPU $gbs GB/s" >&2
 fi
 
-# ---- while serving: the GPU busy (>= 10% utilization) with the link at Gen 1 in 5 samples in a row (2 s apart).
+# ---- while serving: the link at Gen 1 in 5 samples in a row (2 s apart) while the GPU is busy (>= 10% utilization)
+# or held (then even idle samples count: a held GPU keeps the link at full speed).
 # Measured on a healthy link: every busy sample was at Gen 4 (144 of 144 through prompt reading and decoding).
 watch_link() {
     local util gen n=0 warned=0 fixed=-1000
     while IFS=', ' read -r util gen; do
         [[ $util =~ ^[0-9]+$ && $gen =~ ^[0-9]+$ ]] || continue
-        (( util < 10 )) && continue                 # idle: Gen 1 is normal power saving
+        (( util < 10 && !HELD )) && continue        # idle and not held: Gen 1 is normal power saving
         if (( gen > 1 )); then n=0; warned=0; continue; fi
         (( ++n < 5 )) && continue
         n=0
@@ -91,7 +124,6 @@ watch_link() {
         fi
     done
 }
-WATCH_PIDS=()
 if [[ $WATCH_LINK == 1 ]] && command -v nvidia-smi >/dev/null; then
     WDIR=$(mktemp -d)
     mkfifo "$WDIR/smi"
@@ -100,12 +132,6 @@ if [[ $WATCH_LINK == 1 ]] && command -v nvidia-smi >/dev/null; then
     WATCH_PIDS+=($!)
     watch_link < "$WDIR/smi" &
     WATCH_PIDS+=($!)
-    # background jobs of a script ignore Ctrl-C, so stop them on every way out: Ctrl-C, kill, a closed terminal, exit
-    stop_watch() { kill "${WATCH_PIDS[@]}" 2>/dev/null; rm -rf "$WDIR"; }
-    trap stop_watch EXIT
-    trap 'stop_watch; trap - INT; kill -INT $$' INT
-    trap 'stop_watch; exit 143' TERM
-    trap 'stop_watch; exit 129' HUP
 fi
 
 FRONT=()

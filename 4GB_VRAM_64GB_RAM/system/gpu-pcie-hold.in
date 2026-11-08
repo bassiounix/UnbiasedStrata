@@ -1,0 +1,23 @@
+#!/bin/bash
+# gpu-pcie-hold - keep the NVIDIA GPU (@GPU@) in its full-power state while a model is served.
+#
+# The NVIDIA driver lowers the PCIe link to Gen 1 whenever the GPU idles (P8) and raises it again under load. Now and
+# then the raise fails and the link stays at Gen 1 (~1 GB/s instead of ~13) until a retrain or a reboot. Holding the
+# memory clock at its maximum keeps the GPU out of P8, so the link is never lowered and never has to be raised.
+#
+#   gpu-pcie-hold on     lock the memory clock at its maximum (idle power goes up while held)
+#   gpu-pcie-hold off    release it: normal idle power saving
+#
+# Installed root-owned in /usr/local/sbin by `install.sh --system`, and allowed without a password (exactly these two
+# commands) through /etc/sudoers.d/gpu-pcie-hold, so strata-agent can hold the GPU while it serves.
+set -u
+GPU=@GPU@
+case ${1:-} in
+    on)
+        max=$(nvidia-smi -i "$GPU" --query-gpu=clocks.max.memory --format=csv,noheader,nounits) || exit 1
+        exec nvidia-smi -i "$GPU" --lock-memory-clocks="$max,$max" ;;
+    off)
+        exec nvidia-smi -i "$GPU" --reset-memory-clocks ;;
+    *)
+        echo "usage: gpu-pcie-hold on|off" >&2; exit 2 ;;
+esac
