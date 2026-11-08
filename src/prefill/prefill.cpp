@@ -492,6 +492,8 @@ struct Alloc {
     bool count_only = false;
     bool spill = false, spilled = false;
     std::vector<void*>* owned = nullptr;
+    uint8_t* base2 = nullptr;           ///< STRATA_PREFILL_IN_DENSE: a second borrowed region, before the spill
+    uint64_t cap2 = 0, used2 = 0;
     template <typename T> T* take(size_t n, bool& ok) {
         uint64_t bytes = ((uint64_t) n * sizeof(T) + 256 + 255) & ~255ull;
         if (count_only) {
@@ -502,6 +504,11 @@ struct Alloc {
         if (base != nullptr && !spilled && used + bytes <= cap) {
             T* p = (T*) (base + used);
             used += bytes;
+            return p;
+        }
+        if (base2 != nullptr && used2 + bytes <= cap2) {
+            T* p = (T*) (base2 + used2);
+            used2 += bytes;
             return p;
         }
         if (base != nullptr && !spill) { ok = false; failed_bytes = bytes; return nullptr; }
@@ -865,6 +872,13 @@ struct Prefill::Impl {
     bool borrowed = false, borrow_spill = false;
     cudaStream_t cs = nullptr, copy = nullptr;
     Gemm gemm;
+    // STRATA_PREFILL_IN_DENSE (set_dense_loan): the two layer slots at the start of the dense projections' block, the
+    // stream their copies run on, and per slot: its copy done, its last reader done, the layer it holds
+    uint8_t* dl_slot[2] = {nullptr, nullptr};
+    cudaStream_t dl_stream = nullptr;
+    cudaEvent_t dl_copied[2] = {nullptr, nullptr}, dl_free[2] = {nullptr, nullptr};
+    bool dl_free_set[2] = {false, false};
+    int64_t dl_layer[2] = {-1, -1};
     std::vector<void*> owned;
     // chunk buffers
     float *emb = nullptr, *R = nullptr, *xn = nullptr, *lo = nullptr, *gated = nullptr, *inj = nullptr;
@@ -1048,6 +1062,11 @@ void Prefill::release() {
     if (impl_->cs) cudaStreamSynchronize(impl_->cs);
     if (impl_->copy) cudaStreamSynchronize(impl_->copy);
     if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
+    if (impl_->dl_stream) { cudaStreamSynchronize(impl_->dl_stream); cudaStreamDestroy(impl_->dl_stream); }
+    for (int b = 0; b < 2; ++b) {
+        if (impl_->dl_copied[b]) cudaEventDestroy(impl_->dl_copied[b]);
+        if (impl_->dl_free[b]) cudaEventDestroy(impl_->dl_free[b]);
+    }
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1298,6 +1317,27 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
         m.tok_up.init((size_t) chunk);
     }
     if (cudaStreamCreateWithFlags(&m.copy, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: copy stream"; return false; }
+    uint8_t* dense_rest = nullptr;
+    uint64_t dense_rest_bytes = 0;
+    if (dense_loan_.dev != nullptr) {
+        const DenseLoan& dl = dense_loan_;
+        const uint64_t slot = (dl.max_layer_bytes + (64u << 10) - 1) / (64u << 10) * (64u << 10);
+        if (next_ != nullptr || helper_ != nullptr || dl.bytes <= 2 * slot + (64u << 20)) {
+            err = "prefill: STRATA_PREFILL_IN_DENSE needs one GPU and a block larger than two layers";
+            return false;
+        }
+        if (cudaStreamCreateWithFlags(&m.dl_stream, cudaStreamNonBlocking) != cudaSuccess) { err = "prefill: dense copy stream"; return false; }
+        for (int b = 0; b < 2; ++b)
+            if (cudaEventCreateWithFlags(&m.dl_copied[b], cudaEventDisableTiming) != cudaSuccess ||
+                cudaEventCreateWithFlags(&m.dl_free[b], cudaEventDisableTiming) != cudaSuccess) {
+                err = "prefill: dense copy events";
+                return false;
+            }
+        m.dl_slot[0] = dl.dev;
+        m.dl_slot[1] = dl.dev + slot;
+        dense_rest = dl.dev + 2 * slot;
+        dense_rest_bytes = (dl.bytes - 2 * slot) & ~(uint64_t) 255;
+    }
     const size_t T = (size_t) chunk;
     m.T_max = chunk;
     m.borrowed = borrow != nullptr;
@@ -1393,6 +1433,8 @@ bool Prefill::init(const core::WeightTable& wt, const core::ModelGeometry& g, co
     o.cap = borrow_bytes;
     o.spill = m.borrow_spill;
     o.owned = &m.owned;
+    o.base2 = dense_rest;
+    o.cap2 = dense_rest_bytes;
     {
         uint16_t* gs = o.take<uint16_t>((size_t) GEMM_SCRATCH, ok);
         void* ws = o.take<uint8_t>(GEMM_WS, ok);
@@ -1528,8 +1570,14 @@ bool Prefill::carve(size_t T, void* alloc) {
     return ok;
 }
 
+void Prefill::set_dense_loan(const DenseLoan& loan) { dense_loan_ = loan; }
+
 bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err) {
     Impl& m = *impl_;
+    if (dense_loan_.dev != nullptr) {
+        err = "prefill: relayout is not supported with STRATA_PREFILL_IN_DENSE";
+        return false;
+    }
     if (m.borrow_spill) {
         err = "prefill: a hybrid borrowed/owned layout cannot be changed between requests";
         return false;
@@ -2268,10 +2316,28 @@ const core::WeightRef* need(const core::LayerView& v, const char* suffix, std::s
     if (!r) err = v.name(suffix) + " is missing";
     return r;
 }
+// STRATA_PREFILL_IN_DENSE: while a layer is read, its projections are read from the slot they were streamed into
+// ([lo, hi) of the block maps to `to`); a projection elsewhere in the block would be a prompt buffer by now.  The prompt
+// path runs on one host thread and the loan is for one GPU only.
+struct DenseRedirect {
+    const uint8_t *lo = nullptr, *hi = nullptr, *blk_lo = nullptr, *blk_hi = nullptr;
+    const uint8_t* to = nullptr;
+};
+DenseRedirect g_dense;
 bool native_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
                  std::string& err, int64_t ldy = 0, int64_t ldx = 0) {
     if (!w->native_data) { err = "prefill: " + name + " has no native GGUF blocks (run with --native)"; return false; }
-    gm.native(X, w->native_type, w->native_data, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
+    const void* wd = w->native_data;
+    if (g_dense.to != nullptr) {
+        const uint8_t* p = (const uint8_t*) wd;
+        if (p >= g_dense.lo && p < g_dense.hi) {
+            wd = g_dense.to + (p - g_dense.lo);
+        } else if (p >= g_dense.blk_lo && p < g_dense.blk_hi) {
+            err = "prefill: STRATA_PREFILL_IN_DENSE: " + name + " is not in the layer being read";
+            return false;
+        }
+    }
+    gm.native(X, w->native_type, wd, Y, T, w->ne1, w->ne0, ldy, 0.0f, ldx);
     return true;
 }
 bool bf16_proj(Gemm& gm, const core::WeightRef* w, const uint16_t* X, float* Y, int64_t T, const std::string& name,
@@ -2464,6 +2530,40 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     PeTimer pe;
     if (m.pp) pe.dev = m.pp->dev; else pe.on = false;
     const cudaStream_t cs = (cudaStream_t) m.cs;
+    // STRATA_PREFILL_IN_DENSE: layer l's projections are read from slot l & 1, streamed from the block's pinned copy;
+    // the next layer's are copied into the other slot while l is read.  A slot is written only after everything that
+    // read it is done (dl_free, recorded on the compute stream right before the copy is issued).
+    const DenseLoan& dl = dense_loan_;
+    g_dense = DenseRedirect{};
+    m.dl_layer[0] = m.dl_layer[1] = -1;   // the block may have been written back since the last prompt
+    auto dense_issue = [&](int64_t l) {
+        const int s = (int) (l & 1);
+        cudaEventRecord(m.dl_free[s], cs);   // every reader of the slot so far is on cs, before this point
+        m.dl_free_set[s] = true;
+        cudaStreamWaitEvent(m.dl_stream, m.dl_free[s], 0);
+        cudaMemcpyAsync(m.dl_slot[s], dl.host + dl.layer_off[(size_t) l], dl.layer_bytes[(size_t) l],
+                        cudaMemcpyHostToDevice, m.dl_stream);
+        cudaEventRecord(m.dl_copied[s], m.dl_stream);
+        m.dl_layer[s] = l;
+    };
+    auto dense_layer = [&](int64_t l, int64_t le) {
+        if (dl.dev == nullptr) return;
+        g_dense.blk_lo = dl.dev;
+        g_dense.blk_hi = dl.dev + dl.bytes;
+        const bool has = l >= 0 && l < dl.n_layers && dl.layer_bytes[(size_t) l] > 0;
+        const int s = (int) (l & 1);
+        if (has) {
+            if (m.dl_layer[s] != l) dense_issue(l);
+            cudaStreamWaitEvent(cs, m.dl_copied[s], 0);
+            g_dense.lo = dl.dev + dl.layer_off[(size_t) l];
+            g_dense.hi = g_dense.lo + dl.layer_bytes[(size_t) l];
+            g_dense.to = m.dl_slot[s];
+        } else {
+            g_dense.lo = g_dense.hi = nullptr;
+            g_dense.to = m.dl_slot[s];   // any projection of the block is then an error
+        }
+        if (l + 1 < le && l + 1 < dl.n_layers && dl.layer_bytes[(size_t) (l + 1)] > 0) dense_issue(l + 1);
+    };
     // the MMQ row table lives in the borrowed cache slots, which the refill after a prompt overwrites with experts:
     // write it again for every prompt (a layout is reused as long as the chunk and the slots are the same)
     if (m.ids_identity != nullptr) mmq::iota(m.ids_identity, m.T * K, m.cs);
@@ -2893,6 +2993,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
             const core::LayerView v(*m.wt, l);
+            dense_layer(l, LE);
             if (l == std::max<int64_t>(LB, 1) && !ple_land()) return false;   // the PLE rows, read from layer 1 on
             // ---- the PLE block at layer 1, token by token (its conv reads the previous tokens' rows)
             if (l == 1 && ple_on && ple_batch) {

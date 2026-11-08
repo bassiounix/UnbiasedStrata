@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # strata-agent - serve Swift 1.5 Qwen3.8-Flash-Next IQ3_XXS for agent use on a 4 GB GPU + 64 GB RAM machine:
-# 128K context, 768-token prompt chunks, images through the vision projector on the CPU.
+# 128K context, 4096-token prompt chunks, images through the vision projector on the CPU.
 #
 # Measured 2026-11-08 on an RTX 3050 Ti Laptop (4 GB, PCIe Gen 4 x8, AC power) + i7-12700H + 64 GB RAM:
-#   cold 25K-token system prompt 186 tok/s, 2.5K-token agent turns ~160 tok/s, decode ~19 tok/s;
-#   a repeated system prompt is reused from the cache (a new conversation reads only its new tokens).
+#   cold 25K-token system prompt 462-478 tok/s (52-54 s), ~3K-token agent turns ~390 tok/s (7.6-8 s), decode ~17-19
+#   tok/s; a repeated system prompt is reused from the cache (a new conversation reads only its new tokens).
+#   (The earlier 768-token chunks with pageable experts: 180 tok/s cold, 160-168 tok/s turns, the same decode.)
 #
 # The PCIe link: the NVIDIA driver sometimes leaves it stuck at Gen 1 (~1 GB/s instead of ~13; prompt reading ~4x
 # slower).  Before loading anything strata-agent measures it (pcie-probe), and while serving it watches for the stuck
@@ -15,14 +16,14 @@
 #
 # Settings: ~/.config/strata-agent.conf (written by install.sh); any of them can be overridden from the environment:
 #   REPO=~/dev/UnbiasedStrata  MODEL_DIR=~/dev/models/swift-iq3_xxs  HOST=127.0.0.1  PORT=18090
-#   CONTEXT=131072  CHUNK=768  VISION=1  VISION_THREADS=12  WATCH_LINK=1  AUTO_RETRAIN=0
+#   CONTEXT=131072  CHUNK=4096  PIN_EXPERTS=1  VISION=1  VISION_THREADS=12  WATCH_LINK=1  AUTO_RETRAIN=0
 # Extra arguments go to the engine (after the front end's `--`).
 set -uo pipefail
 
 CONF=${STRATA_AGENT_CONF:-$HOME/.config/strata-agent.conf}
 _env_REPO=${REPO-}; _env_MODEL_DIR=${MODEL_DIR-}; _env_HOST=${HOST-}; _env_PORT=${PORT-}; _env_CONTEXT=${CONTEXT-}
 _env_CHUNK=${CHUNK-}; _env_VISION=${VISION-}; _env_VISION_THREADS=${VISION_THREADS-}
-_env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}
+_env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}; _env_PIN_EXPERTS=${PIN_EXPERTS-}
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
 REPO=${_env_REPO:-${REPO:-$HOME/dev/UnbiasedStrata}}
@@ -30,7 +31,8 @@ MODEL_DIR=${_env_MODEL_DIR:-${MODEL_DIR:-$HOME/dev/models/swift-iq3_xxs}}
 HOST=${_env_HOST:-${HOST:-127.0.0.1}}
 PORT=${_env_PORT:-${PORT:-18090}}
 CONTEXT=${_env_CONTEXT:-${CONTEXT:-131072}}
-CHUNK=${_env_CHUNK:-${CHUNK:-768}}
+CHUNK=${_env_CHUNK:-${CHUNK:-4096}}
+PIN_EXPERTS=${_env_PIN_EXPERTS:-${PIN_EXPERTS:-1}}
 VISION=${_env_VISION:-${VISION:-1}}
 VISION_THREADS=${_env_VISION_THREADS:-${VISION_THREADS:-12}}
 WATCH_LINK=${_env_WATCH_LINK:-${WATCH_LINK:-1}}
@@ -115,16 +117,25 @@ cd "$REPO" || exit 1
 #   STRATA_HC_REQ8=1            hyper-connection projections as int8: ~525 MiB of VRAM back (the head fits)
 #   STRATA_IDX_HOST=1           indexer pooled keys + RoPE table in pinned RAM (this fork)
 #   STRATA_PREFILL_IN_HEAD=1    the prompt path's buffers in the output head's VRAM, head restored after (this fork)
-#   STRATA_PF_GEMM_*_MIB        smaller prompt GEMM scratch/workspace so a 768-token chunk fits (this fork)
-#   STRATA_RESIDENT_PIN=0       the experts' RAM copy pageable: pinning it costs ~80 MiB of VRAM in page tables
+#   STRATA_PREFILL_IN_DENSE=1   ... and in the dense projections' VRAM (1.6 GiB, one block - 118 MiB less than 300
+#                               separate allocations): while a prompt is read each layer's projections are streamed
+#                               from a pinned RAM copy into two slots, and the block is written back after the prompt
+#                               (~0.17 s with the head).  That room is what lets a chunk be 4096 tokens; every chunk
+#                               streams all 42.9 GB of experts over PCIe (3.3 s), so bigger chunks read faster (this fork)
+#   STRATA_PF_GEMM_*_MIB        smaller prompt GEMM scratch/workspace (this fork)
+#   PIN_EXPERTS=1               the experts' RAM copy page-locked (--resident-experts' default): the GPU copies them
+#                               straight from it instead of through CPU staging copies (+26% prompt reading); ~80 MiB
+#                               of VRAM in page tables.  If 40 GiB cannot be locked the engine falls back to pageable
+#                               RAM by itself.  PIN_EXPERTS=0 sets STRATA_RESIDENT_PIN=0 (pageable, as before)
 #   --expert-cache 1            the verify path needs one slot; there is no VRAM for more
 #   --suffix-draft 0            keeps the verify window at 2 rows: its graphs fit in what is left
 #   --short-read 0              required by STRATA_PREFILL_IN_HEAD
 #   --kv q4_0 --kv-resident 20480   4-bit K/V streamed from pinned RAM, 20480 cells per layer in VRAM (the minimum)
 #   --resident-experts          the experts the GPU does not hold kept in RAM (needs ~44 GiB available at start)
-export CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 STRATA_RESIDENT_PIN=0 \
-       STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 \
+export CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 \
+       STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 STRATA_PREFILL_IN_DENSE=1 \
        STRATA_PF_GEMM_SCRATCH_MIB=16 STRATA_PF_GEMM_WS_MIB=4
+if [[ $PIN_EXPERTS == 1 ]]; then unset STRATA_RESIDENT_PIN; else export STRATA_RESIDENT_PIN=0; fi
 
 build/bin/unbiased-strata --engine build/bin/strata -m "$SH1" \
   --host "$HOST" --port "$PORT" --alias swift-iq3_xxs "${FRONT[@]}" \
@@ -138,6 +149,10 @@ while IFS= read -r line; do
         printf '\n*** strata-agent: the PCIe link is stuck (%s GB/s, should be ~13): prompt reading will be ~4x slower.\n' \
                "${BASH_REMATCH[1]}" >&2
         printf '*** Stop this (Ctrl-C), run:  gpu-mode retrain   and start strata-agent again.\n\n' >&2
+    fi
+    if [[ $line == *"FileExpertSource:"*"trying pageable memory"* ]]; then
+        printf '\n*** strata-agent: the experts could not be page-locked (not enough free RAM): prompt reading ~20%% slower.\n' >&2
+        printf '*** Close memory-heavy programs and restart for full speed.\n\n' >&2
     fi
     if [[ $line == *"the whole resident RAM mode does not fit"* ]]; then
         printf '\n*** strata-agent: not all experts fit in RAM - close memory-heavy programs and restart for full speed.\n\n' >&2

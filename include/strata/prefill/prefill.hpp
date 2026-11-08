@@ -78,6 +78,22 @@ public:
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
     int64_t chunk() const;
 
+    /// STRATA_PREFILL_IN_DENSE: the dense projections' one block (NativeDense::consolidate) is lent as a second region
+    /// for this path's buffers, after `borrow`'s (one GPU; with a hybrid loan).  Its first two slots of
+    /// `max_layer_bytes` hold the layer being read and the next one, streamed from the pinned copy `host`; the rest
+    /// holds buffers.  The caller writes the block back (restore_block) before the projections are read elsewhere.
+    /// Set before `init`; `dev` null = off.
+    struct DenseLoan {
+        uint8_t* dev = nullptr;
+        const uint8_t* host = nullptr;
+        uint64_t bytes = 0;
+        const uint64_t* layer_off = nullptr;
+        const uint64_t* layer_bytes = nullptr;
+        int64_t n_layers = 0;
+        uint64_t max_layer_bytes = 0;
+    };
+    void set_dense_loan(const DenseLoan& loan);
+
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed
     /// ring (a big one only pays when the copy engine, not the host copies, is the limit); set before bytes_needed.
     static void set_pinned_share(double share);
@@ -249,6 +265,7 @@ private:
     int64_t stage_lb_ = 0, stage_le_ = -1;
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
+    DenseLoan dense_loan_;              ///< set_dense_loan (kept across `reset`)
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)

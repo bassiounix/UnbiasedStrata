@@ -3665,6 +3665,20 @@ int main(int argc, char** argv) {
         }
         std::fprintf(stderr, "strata generate: %zu native projection matrices, %.2f MiB of weights, in %.1f s\n",
                      native_dense.tensor_count(), (double) native_dense.weight_bytes() / (1024.0 * 1024.0), load_s());
+        // STRATA_PREFILL_IN_DENSE=1 (opt-in, small cards; with STRATA_PREFILL_IN_HEAD): the layers' projections in one
+        // block with a pinned copy, which the prompt path borrows for its buffers while a prompt is read (see below)
+        if (const char* e = std::getenv("STRATA_PREFILL_IN_DENSE"); e != nullptr && e[0] == '1') {
+            const uint64_t was = native_dense.allocated_bytes();
+            if (!native_dense.consolidate(wt, err)) {
+                std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_DENSE: %s\n", err.c_str());
+                return 1;
+            }
+            const auto* b = native_dense.block();
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_DENSE=1: the projections of %zu layers in one "
+                                 "%.1f MiB block (was ~%.1f MiB in separate allocations; the largest layer %.1f MiB), "
+                                 "a pinned copy in RAM\n", b->layer_bytes.size(), b->bytes / 1048576.0,
+                         was / 1048576.0, b->max_layer_bytes / 1048576.0);
+        }
     }
 
     strata::kernels::gr_set_fp32_activations(o.gr_fp32_activations);
@@ -5282,6 +5296,20 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_HEAD=1: the prompt path's buffers share the output "
                              "head's %llu MiB of VRAM; the head is written back from RAM after each prompt read\n",
                      (unsigned long long) (native_head.weight_bytes() >> 20));
+    }
+    // STRATA_PREFILL_IN_DENSE=1: the dense projections' block (consolidated above) is the prompt path's second loan; the
+    // path streams each layer's projections into two slots of it, and the block is written back after the prompt
+    bool dense_in_place = false;
+    if (native_dense.block() != nullptr) {
+        const char* why = !head_in_place ? "it needs STRATA_PREFILL_IN_HEAD=1"
+                        : !o.mtp.empty() ? "it does not support --mtp (the drafter reads the projections mid-prompt)"
+                        : multi_gpu ? "it supports one GPU only"
+                        : nullptr;
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: STRATA_PREFILL_IN_DENSE is unavailable: %s\n", why);
+            return 2;
+        }
+        dense_in_place = true;
     }
     std::vector<float> logits((size_t) n_vocab);
     mem_mark("the native head");
@@ -8247,6 +8275,18 @@ int main(int argc, char** argv) {
             if (share_pool) sp.set_cpu_pool(&pool);
             // STRATA_PREFILL_IN_HEAD: no cache loan, so the head's VRAM is the loan (hybrid: the rest is the path's own)
             const bool in_head = head_in_place && borrow == nullptr;
+            if (in_head && dense_in_place) {
+                const auto* b = native_dense.block();
+                strata::prefill::Prefill::DenseLoan dl;
+                dl.dev = b->dev;
+                dl.host = b->host;
+                dl.bytes = b->bytes;
+                dl.layer_off = b->layer_off.data();
+                dl.layer_bytes = b->layer_bytes.data();
+                dl.n_layers = (int64_t) b->layer_off.size();
+                dl.max_layer_bytes = b->max_layer_bytes;
+                sp.set_dense_loan(dl);
+            }
             if (!sp.init(wt, g, ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err,
                          in_head ? native_head.loan() : borrow,
                          in_head ? (native_head.weight_bytes() & ~(uint64_t) 255) : borrow_bytes,
@@ -8334,7 +8374,7 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (head_in_place) {   // the init may have written its buffers over the head: back before anything reads it
-            if (!native_head.restore(err)) {
+            if (!native_head.restore(err) || (dense_in_place && !native_dense.restore_block(err))) {
                 std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: %s\n", err.c_str());
                 return 1;
             }
@@ -13500,12 +13540,13 @@ int main(int argc, char** argv) {
             }
             if (head_in_place && sp.stats().chunks != head_chunks_seen) {   // a prompt read ran over the head's VRAM
                 const auto head_t0 = Clock::now();
-                if (!native_head.restore(err)) {
+                if (!native_head.restore(err) || (dense_in_place && !native_dense.restore_block(err))) {
                     std::printf("ERR STRATA_PREFILL_IN_HEAD: %s\n", err.c_str());
                     return 1;
                 }
                 head_chunks_seen = sp.stats().chunks;
-                std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: output head written back in %.1f ms\n",
+                std::fprintf(stderr, "strata serve: STRATA_PREFILL_IN_HEAD: output head%s written back in %.1f ms\n",
+                             dense_in_place ? " and dense projections" : "",
                              std::chrono::duration<double, std::milli>(Clock::now() - head_t0).count());
             }
             if (o.prefill_head_alias) {

@@ -57,7 +57,28 @@ public:
     uint64_t allocated_bytes() const { return allocated_; }
     size_t tensor_count() const { return weights_.size() - packed_keys_.size(); }
 
+    /// STRATA_PREFILL_IN_DENSE (opt-in, small cards, one GPU): every `blk.<l>.` projection `load` uploaded (not the
+    /// PLE's) moves into ONE device block, layer after layer, each matrix followed by zeroed bytes (a GEMM tile may read
+    /// past a matrix's end), with a pinned copy of the block in RAM.  Call it right after `load`, before anything reads
+    /// the pointers.  It also ends the per-matrix 2 MiB granule rounding.  The prompt path can then carve its buffers in
+    /// the block while a prompt is read (it streams each layer's projections from the RAM copy into one of two slots
+    /// at the block's start) and `restore_block` writes the block back - at the same addresses, which the captured
+    /// verify graphs keep - before tokens are generated.
+    struct Block {
+        uint8_t* dev = nullptr;              ///< the block (device)
+        const uint8_t* host = nullptr;       ///< its pinned copy
+        uint64_t bytes = 0;
+        std::vector<uint64_t> layer_off, layer_bytes;   ///< per layer: the span of its projections in the block
+        uint64_t max_layer_bytes = 0;
+    };
+    bool consolidate(WeightTable& table, std::string& err);
+    const Block* block() const { return block_.dev != nullptr ? &block_ : nullptr; }
+    /// Device-synchronous: waits for all work (the prompt path's streams may still write the block), then copies.
+    bool restore_block(std::string& err) const;
+
 private:
+    Block block_;
+    void* block_host_ = nullptr;
     std::vector<void*> weights_;
     std::vector<const void*> packed_keys_;   // GGUF-layout pointers registered with STRATA_Q8_PACKED=1
     void* scratch_ = nullptr;

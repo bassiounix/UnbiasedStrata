@@ -246,6 +246,88 @@ NativeDense::~NativeDense() {
     for (const void* p : packed_keys_) strata::kernels::native_q8_0_packed_unregister(p);
     if (scratch_) cudaFree(scratch_);
     for (void* p : weights_) cudaFree(p);
+    if (block_host_) cudaFreeHost(block_host_);
+}
+
+bool NativeDense::consolidate(WeightTable& table, std::string& err) {
+    if (block_.dev != nullptr) return true;
+    if (!packed_keys_.empty()) { err = "native dense: one block does not support STRATA_Q8_PACKED"; return false; }
+    struct Item { int64_t layer; std::string name; WeightRef* ref; uint64_t bytes, off; };
+    std::vector<Item> items;
+    for (auto& [name, ref] : table.table_) {
+        if (ref.native_data == nullptr || name.rfind("blk.", 0) != 0 || name.find("ple") != std::string::npos) continue;
+        if (std::find(weights_.begin(), weights_.end(), ref.native_data) == weights_.end()) continue;   // not `load`'s
+        const long l = std::strtol(name.c_str() + 4, nullptr, 10);
+        if (l < 0 || l > 4096) continue;
+        items.push_back({(int64_t) l, name, &ref,
+                         (uint64_t) strata::kernels::native_mmvq_weight_bytes(ref.native_type, (int) ref.ne0, (int) ref.ne1), 0});
+    }
+    if (items.empty()) { err = "native dense: no per-layer projections to put in one block"; return false; }
+    std::sort(items.begin(), items.end(), [](const Item& a, const Item& b) {
+        return a.layer != b.layer ? a.layer < b.layer : a.name < b.name;
+    });
+    // each matrix starts 4 KiB-aligned and is followed by at least 64 KiB of zeros: a tile that reads past its end (the
+    // 640-wide shared-expert down rows) meets zero weights, as it met the slack of its own allocation before
+    constexpr uint64_t kAlign = 4096, kPad = 64 * 1024;
+    const int64_t n_layers = items.back().layer + 1;
+    block_.layer_off.assign((size_t) n_layers, 0);
+    block_.layer_bytes.assign((size_t) n_layers, 0);
+    uint64_t off = 0;
+    int64_t cur = -1;
+    for (Item& it : items) {
+        if (it.layer != cur) {
+            if (cur >= 0) block_.layer_bytes[(size_t) cur] = off - block_.layer_off[(size_t) cur];
+            cur = it.layer;
+            block_.layer_off[(size_t) cur] = off;
+        }
+        it.off = off;
+        off = (off + it.bytes + kPad + kAlign - 1) / kAlign * kAlign;
+    }
+    block_.layer_bytes[(size_t) cur] = off - block_.layer_off[(size_t) cur];
+    const uint64_t total = off;
+    for (uint64_t b : block_.layer_bytes) block_.max_layer_bytes = (std::max)(block_.max_layer_bytes, b);
+    void* host = nullptr;
+    if (cudaHostAlloc(&host, total, cudaHostAllocDefault) != cudaSuccess) {
+        (void) cudaGetLastError();
+        err = "native dense: cannot pin " + std::to_string(total >> 20) + " MiB of RAM for the block's copy";
+        return false;
+    }
+    std::memset(host, 0, total);
+    for (const Item& it : items)
+        if (cudaMemcpy((uint8_t*) host + it.off, it.ref->native_data, it.bytes, cudaMemcpyDeviceToHost) != cudaSuccess) {
+            cudaFreeHost(host);
+            err = "native dense: copying " + it.name + " to RAM failed";
+            return false;
+        }
+    // the old allocations go first: the block needs their VRAM
+    for (const Item& it : items) {
+        auto pos = std::find(weights_.begin(), weights_.end(), it.ref->native_data);
+        cudaFree(*pos);
+        weights_.erase(pos);
+        it.ref->native_data = nullptr;
+    }
+    void* dev = nullptr;
+    cudaError_t e = cudaMalloc(&dev, total);
+    if (e == cudaSuccess) e = cudaMemcpy(dev, host, total, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) {
+        err = std::string("native dense: the one block (") + std::to_string(total >> 20) + " MiB): " + cudaGetErrorString(e);
+        return false;   // the projections are gone: the caller stops
+    }
+    for (const Item& it : items) it.ref->native_data = (uint8_t*) dev + it.off;
+    weights_.push_back(dev);
+    block_host_ = host;
+    block_.dev = (uint8_t*) dev;
+    block_.host = (const uint8_t*) host;
+    block_.bytes = total;
+    return true;
+}
+
+bool NativeDense::restore_block(std::string& err) const {
+    if (block_.dev == nullptr) { err = "native dense: restore_block without a block"; return false; }
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e == cudaSuccess) e = cudaMemcpy(block_.dev, block_.host, block_.bytes, cudaMemcpyHostToDevice);
+    if (e != cudaSuccess) { err = std::string("native dense: restore_block: ") + cudaGetErrorString(e); return false; }
+    return true;
 }
 
 bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& table, std::string& err,
