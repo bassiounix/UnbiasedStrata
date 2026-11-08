@@ -41,7 +41,7 @@ REPO=$REPO
 MODEL_DIR=$MODEL_DIR
 #HOST=127.0.0.1
 #PORT=18090
-#CONTEXT=131072
+#CONTEXT=262144
 #CHUNK=4096
 # 1 = the experts' RAM copy page-locked (~26% faster prompt reading, ~43 GiB locked in all); 0 = ordinary RAM
 #PIN_EXPERTS=1

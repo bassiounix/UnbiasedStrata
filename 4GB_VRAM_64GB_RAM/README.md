@@ -7,15 +7,15 @@ system prompts, many turns, images. Everything here was measured on that laptop 
 
 | What | Result |
 |---|---|
-| Context window | 131,072 tokens (262,144 also fits with the same settings - see [262K](#the-262k-variant)) |
+| Context window | 262,144 tokens, the default (the speeds below were measured at 131,072 - see [Context size](#context-size-262k-default-and-128k)) |
 | Cold read of a 25K-token system prompt | **460-478 tok/s** (52-54 s) |
 | Agent turn with a ~3K-token tool output | 385-394 tok/s (7.6-8.0 s) |
 | Next turn / new conversation with the same system prompt | the prompt is reused from the cache: ~25 new tokens, ~1 s |
 | Fresh prompts of 1K to 75K tokens | 158-184 tok/s with the earlier 768-token chunks (not re-measured at 4096) |
 | Decode | ~17-19 tok/s (with 768-token chunks: 20.6 near an empty context, 16.3 at 75K tokens) |
 | Images | yes: encoded on the CPU, ~8 s for a 260-token picture |
-| VRAM left free while serving | ~220 MiB of 4,096 |
-| RAM | ~43 GiB page-locked (the experts and copies of what the GPU lends out); ~44 GiB must be free at start |
+| VRAM left free while serving | ~212 MiB of 4,096 (~220 at 128K) |
+| RAM | ~44 GiB page-locked (the experts, the K/V, and copies of what the GPU lends out); ~45 GiB must be free at start |
 
 The starting point was an engine that stopped at load with `native head upload: out of memory (236 MiB of 3767 MiB
 VRAM free)` at a 2,048-token context. Getting from there to the table above took seven engine changes (all opt-in,
@@ -36,7 +36,7 @@ fraction of its speed.
 10. [The PCIe link problem](#the-pcie-link-problem)
 11. [How the configuration was found](#how-the-configuration-was-found)
 12. [Engine changes in this fork](#engine-changes-in-this-fork)
-13. [The 262K variant](#the-262k-variant)
+13. [Context size: 262K (default) and 128K](#context-size-262k-default-and-128k)
 14. [Troubleshooting](#troubleshooting)
 15. [Undo everything](#undo-everything)
 16. [Files in this folder](#files-in-this-folder)
@@ -57,7 +57,7 @@ fraction of its speed.
 | Engine | this fork, branch `4gb-vram` (upstream UnbiasedStrata engine 0.1.45) |
 
 Other 4 GB / 64 GB machines should work the same way. What matters: CUDA compute capability 7.5 or newer (the build
-here is for 8.6), about 44 GiB of RAM free when the engine starts (about 43 GiB of it is page-locked), and a PCIe link
+here is for 8.6), about 45 GiB of RAM free when the engine starts (about 44 GiB of it is page-locked), and a PCIe link
 that actually runs at its rated speed under load (see [the PCIe link problem](#the-pcie-link-problem)).
 
 ## Quick start
@@ -299,12 +299,12 @@ strata-agent: PCIe host->GPU 13.0 GB/s          # ~13 = healthy; under 5 it warn
 strata generate: PCIe probe: 13.0 GB/s host->device ...
 FileExpertSource: ... resident 39.96 GiB ...                                         # all experts in RAM, page-locked
 strata serve: ~220 MiB of VRAM free with everything loaded - LOW: ...                 # expected: ignore the advice
-... listening on http://127.0.0.1:18090, context 131072 tokens
+... listening on http://127.0.0.1:18090, context 262144 tokens
 ```
 
 The engine's "LOW: add --vram-reserve-mib ..." advice is written for bigger cards; following it does not fit here.
-Loading takes about 50 s (43-59 s over three runs; ~34 s with `PIN_EXPERTS=0`): page-locking the 40 GiB copy of the
-experts is ~42 s of it.
+Loading takes about a minute: 64 s at the 262K default (one run), 43-59 s at 128K (three runs), ~34 s at 128K with
+`PIN_EXPERTS=0`. Page-locking the 40 GiB copy of the experts is ~42 s of it.
 If the experts cannot be page-locked (not enough free RAM), the engine falls back to ordinary RAM by itself and
 `strata-agent` warns that prompt reading is then ~20% slower.
 
@@ -315,7 +315,7 @@ per request. One request is served at a time.
 
 Settings: `~/.config/strata-agent.conf`, or the same names in the environment for one run, e.g.
 `PORT=8080 strata-agent`, `VISION=0 strata-agent`, `PIN_EXPERTS=0 strata-agent`, `CHUNK=2048 strata-agent`. The
-settings are REPO, MODEL_DIR, HOST, PORT, CONTEXT (131072), CHUNK (4096), PIN_EXPERTS (1), VISION (1),
+settings are REPO, MODEL_DIR, HOST, PORT, CONTEXT (262144), CHUNK (4096), PIN_EXPERTS (1), VISION (1),
 VISION_THREADS (12), WATCH_LINK (1) and AUTO_RETRAIN (0). Extra arguments are
 passed to the engine. What every engine option and variable in the launcher does is commented in
 [bin/strata-agent](bin/strata-agent) and explained in [How the configuration was found](#how-the-configuration-was-found).
@@ -335,7 +335,7 @@ build/bin/unbiased-strata --engine build/bin/strata -m $SH1 \
   -- --pack $M/pack --native $SH1 \
      --expert-profile data/expert-profile.bin --expert-cache 1 --vram-reserve-mib 150 \
      --prefill 4096 --spec 2 --suffix-draft 0 --short-read 0 \
-     --max-context 131072 --kv q4_0 --kv-resident 20480 --resident-experts --vision
+     --max-context 262144 --kv q4_0 --kv-resident 20480 --resident-experts --vision
 ```
 
 ### Images
@@ -599,21 +599,22 @@ engine command from [Step 6](#step-6---run) by hand, without `STRATA_PREFILL_IN_
 `STRATA_MTP_EXPERTS_HOST=1 STRATA_MTP_DENSE_HOST=1 STRATA_MTP_FULL_HEAD=1` to the environment and
 `--mtp ~/dev/models/swift-iq3_xxs/mtp/rt --vram-reserve-mib 50` to the engine options.
 
-## The 262K variant
+## Context size: 262K (default) and 128K
+
+`strata-agent` serves the full 262,144-token window by default. With `STRATA_PREFILL_IN_DENSE=1` and page-locked experts
+it fits with the same 4096-token chunks as 128K (no step-down): 212 MiB of VRAM free at rest (220 at 128K), 2.13 GiB of
+pinned RAM for the K/V (1.06 GiB at 128K, ~44 GiB page-locked in all), ready in 64 s, answers coherent. Its prompt-reading
+speed on long prompts is not measured yet (the link was stuck at Gen 1 during that test); every speed in this README
+was measured at 128K. To run at 128K (a little more VRAM and RAM to spare, a faster start):
 
 ```bash
-CONTEXT=262144 strata-agent
+CONTEXT=131072 strata-agent
 ```
 
-With the current default (`STRATA_PREFILL_IN_DENSE=1`, page-locked experts) the full 262,144-token window fits with the
-same 4096-token chunks (no step-down): 212 MiB of VRAM free at rest (220 at 128K), 2.13 GiB of pinned RAM for the K/V
-(1.06 GiB at 128K), ready in 64 s, answers coherent. Its prompt-reading speed is not measured yet: the link was stuck at
-Gen 1 during that test.
-
-Before those two changes only a 128-token chunk fit at 262K (a cold 25K read at 83 tok/s instead of 186). The window
-itself was checked then: a passphrase hidden in the middle of a 25,740-token prompt was found, and the follow-up turn
-reused all 25,748 cached tokens. Decode slows as a conversation gets long, because the indexer keys and the K/V beyond
-20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured on a slow link).
+Before `STRATA_PREFILL_IN_DENSE` and page-locked experts only a 128-token chunk fit at 262K (a cold 25K read at 83 tok/s
+instead of 186). The window itself was checked then: a passphrase hidden in the middle of a 25,740-token prompt was
+found, and the follow-up turn reused all 25,748 cached tokens. Decode slows as a conversation gets long, because the
+indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured on a slow link).
 
 ## Troubleshooting
 
