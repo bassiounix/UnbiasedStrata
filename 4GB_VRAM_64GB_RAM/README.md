@@ -70,7 +70,7 @@ make build CUDA_ARCHS=86                      # your GPU's compute capability, w
 # 3: the model (~76 GB download) -> ~/dev/models/swift-iq3_xxs
 ./4GB_VRAM_64GB_RAM/prepare-model.sh
 
-# 4: the tools on the PATH (+ the root helper for the PCIe link, recommended)
+# 4: the tools on the PATH (+ the root helper for retraining the PCIe link)
 ./4GB_VRAM_64GB_RAM/install.sh --system
 
 # 5: if the GPU was set up for VM passthrough: give it to the host, reboot
@@ -193,7 +193,7 @@ is part of the repository.
 
 ```bash
 ./4GB_VRAM_64GB_RAM/install.sh                 # user part only
-./4GB_VRAM_64GB_RAM/install.sh --system        # also the root helper for the PCIe link (asks for sudo) - recommended
+./4GB_VRAM_64GB_RAM/install.sh --system        # also the root helper for retraining the PCIe link (asks for sudo)
 ./4GB_VRAM_64GB_RAM/install.sh --model-dir /data/swift-iq3_xxs --force-config   # another model directory
 ```
 
@@ -201,7 +201,7 @@ What it puts where:
 
 | Path | What |
 |---|---|
-| `~/.local/bin/strata-agent` | the launcher: the measured configuration, a PCIe check before every start |
+| `~/.local/bin/strata-agent` | the launcher: the measured configuration, a PCIe check at start and a watch on the link while serving |
 | `~/.local/bin/gpu-mode` | who owns the GPU at boot (host / VM), status, PCIe link retrain |
 | `~/.local/share/gpu-mode/pcie-probe` (+ `.cu`) | 4-second host-to-GPU bandwidth probe, built with nvcc for your GPU |
 | `~/.config/strata-agent.conf` | `REPO=` and `MODEL_DIR=` (plus commented defaults: HOST, PORT, CONTEXT, CHUNK, VISION, VISION_THREADS) |
@@ -294,7 +294,7 @@ strata-agent
 It prints, before and while loading:
 
 ```
-strata-agent: PCIe host->GPU 13.0 GB/s          # ~13 = healthy; under 5 it retrains first (with the root helper)
+strata-agent: PCIe host->GPU 13.0 GB/s          # ~13 = healthy; under 5 it warns (see the PCIe link problem)
 strata generate: PCIe probe: 13.0 GB/s host->device ...
 FileExpertSource: pageable resident cache complement ready: resident 39.96 GiB ...   # all experts in RAM
 strata serve: 110 MiB of VRAM free with everything loaded - LOW: ...                 # expected: ignore the advice
@@ -396,9 +396,29 @@ sudo -n /usr/local/sbin/gpu-link-retrain          # the helper (install.sh --sys
 ```
 
 The write sometimes reports `Resource temporarily unavailable` or blocks for a while; the retrain happens anyway
-(both are handled). **Automated:** with the helper installed, `strata-agent` probes the link before every start
-(4 s) and retrains it when it reads under 5 GB/s. A drop in the middle of a session is not caught: restart
-`strata-agent` if prompt reading suddenly gets ~4x slower.
+(both are handled).
+
+**A retrain is not always safe.** It worked about ten times - idle, and three times in the middle of a request with
+the answer unaffected - but once the bandwidth probe that ran right after a retrain made the GPU fall off the bus
+(kernel: `NVRM: Xid (PCI:0000:01:00): 79, pid=..., name=pcie-probe, GPU has fallen off the bus`, then `Xid 154,
+GPU recovery action changed ... (PF FLR)`; `nvidia-smi`: `Unable to determine the device handle for GPU0`). Only a
+reboot brings it back. So retraining is your decision, made between requests, not something done behind your back.
+
+**How strata-agent deals with it:**
+
+- **At start** (4 s): it measures the link with `pcie-probe`. Under 5 GB/s it warns and tells you to run
+  `gpu-mode retrain` and start again.
+- **While serving**: it watches `nvidia-smi` every 2 s (GPU utilization and link generation; nothing is done to the
+  GPU) and warns when the GPU is busy (10% or more) but the link stays at Gen 1 for 5 samples in a row. On a healthy
+  link every busy sample was at Gen 4 (144 of 144, prompt reading and decoding), and idle samples at Gen 1 are
+  normal power saving, so they are ignored. `WATCH_LINK=0` turns it off.
+- **`AUTO_RETRAIN=1`** (environment or `~/.config/strata-agent.conf`, needs `install.sh --system`) lets it retrain by
+  itself: at start (then it waits 5 s before measuring again) and while serving, at most once every 5 minutes. Off
+  by default because of the crash above.
+
+How often it happens: on 2026-11-08, after the vfio handoff, once right after boot, once a few minutes after boot,
+and in the afternoon several times within a minute of a healthy start (one run read at 41 tok/s although the start
+measured 13 GB/s).
 
 ## How the configuration was found
 
@@ -565,6 +585,7 @@ on the slow link). Prompt-lookup drafting fits at 262K/128 (`strata-agent --suff
 | `verify: instantiate: out of memory` at the first answer | less than ~55-60 MiB free after loading | a smaller chunk, drafting off, no external screen on the NVIDIA GPU |
 | `device buffers for a chunk of N tokens do not fit` and a smaller chunk | the chunk is too big; the engine steps down (e.g. 1024 -> 512 at 128K, much slower) | use `CHUNK=768` at 128K, 128 at 262K |
 | prompt reading ~35-40 tok/s, probe ~1 GB/s | the PCIe link is stuck | `gpu-mode retrain`, restart `strata-agent` ([details](#the-pcie-link-problem)) |
+| `nvidia-smi`: `Unable to determine the device handle for GPU0 ... Unknown Error`; kernel `NVRM: Xid ... 79, GPU has fallen off the bus` | the GPU crashed (seen once, right after a link retrain) | reboot; then check `gpu-mode status` and the probe |
 | `the whole resident RAM mode does not fit` | less than ~44 GiB available at start; part of the experts is then read from disk | close memory-heavy programs; the engine counts page cache only if the kernel's `MemAvailable` does |
 | the same, inside a container or an app sandbox | a cgroup memory limit counts the page cache of the model files the process read | drop those files' cache before starting (the snippet below) or raise the limit |
 | GPU at 20 W, link at Gen 2 | on battery | plug in the charger |

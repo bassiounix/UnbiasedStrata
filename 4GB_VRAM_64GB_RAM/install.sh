@@ -45,6 +45,11 @@ MODEL_DIR=$MODEL_DIR
 #CHUNK=768
 #VISION=1
 #VISION_THREADS=12
+# watch the PCIe link while serving and warn when it drops to Gen 1 (reads nvidia-smi only)
+#WATCH_LINK=1
+# 1 = retrain a stuck link by itself through the root helper (install.sh --system). Off by default: a retrain once
+# made the GPU fall off the bus (a reboot to recover)
+#AUTO_RETRAIN=0
 EOF
     echo "install: ~/.config/strata-agent.conf (REPO=$REPO MODEL_DIR=$MODEL_DIR)"
 else

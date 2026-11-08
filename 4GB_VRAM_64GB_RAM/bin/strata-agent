@@ -6,18 +6,23 @@
 #   cold 25K-token system prompt 186 tok/s, 2.5K-token agent turns ~160 tok/s, decode ~19 tok/s;
 #   a repeated system prompt is reused from the cache (a new conversation reads only its new tokens).
 #
-# Before loading anything it measures the PCIe link (pcie-probe): the NVIDIA driver sometimes leaves it stuck at Gen 1
-# (~1 GB/s instead of ~13), and with the root helper installed (install.sh --system) it retrains it automatically.
+# The PCIe link: the NVIDIA driver sometimes leaves it stuck at Gen 1 (~1 GB/s instead of ~13; prompt reading ~4x
+# slower).  Before loading anything strata-agent measures it (pcie-probe), and while serving it watches for the stuck
+# state (GPU busy but the link at Gen 1 for 10 s, read from nvidia-smi - nothing on the GPU is touched).  Either way it
+# tells you; retraining the link is your call (`gpu-mode retrain`), because a retrain once made the GPU fall off the
+# bus (NVRM Xid 79, a reboot to recover).  AUTO_RETRAIN=1 lets it retrain by itself through the root helper
+# (install.sh --system) - at startup, and while serving at most once every 5 minutes.
 #
 # Settings: ~/.config/strata-agent.conf (written by install.sh); any of them can be overridden from the environment:
 #   REPO=~/dev/UnbiasedStrata  MODEL_DIR=~/dev/models/swift-iq3_xxs  HOST=127.0.0.1  PORT=18090
-#   CONTEXT=131072  CHUNK=768  VISION=1  VISION_THREADS=12
+#   CONTEXT=131072  CHUNK=768  VISION=1  VISION_THREADS=12  WATCH_LINK=1  AUTO_RETRAIN=0
 # Extra arguments go to the engine (after the front end's `--`).
 set -uo pipefail
 
 CONF=${STRATA_AGENT_CONF:-$HOME/.config/strata-agent.conf}
 _env_REPO=${REPO-}; _env_MODEL_DIR=${MODEL_DIR-}; _env_HOST=${HOST-}; _env_PORT=${PORT-}; _env_CONTEXT=${CONTEXT-}
 _env_CHUNK=${CHUNK-}; _env_VISION=${VISION-}; _env_VISION_THREADS=${VISION_THREADS-}
+_env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
 REPO=${_env_REPO:-${REPO:-$HOME/dev/UnbiasedStrata}}
@@ -28,6 +33,9 @@ CONTEXT=${_env_CONTEXT:-${CONTEXT:-131072}}
 CHUNK=${_env_CHUNK:-${CHUNK:-768}}
 VISION=${_env_VISION:-${VISION:-1}}
 VISION_THREADS=${_env_VISION_THREADS:-${VISION_THREADS:-12}}
+WATCH_LINK=${_env_WATCH_LINK:-${WATCH_LINK:-1}}
+AUTO_RETRAIN=${_env_AUTO_RETRAIN:-${AUTO_RETRAIN:-0}}
+HELPER=/usr/local/sbin/gpu-link-retrain
 
 # the model files: flat (prepare-model.sh's layout) or as `hf download --local-dir` leaves them (IQ3_XXS/)
 SH1=$(ls "$MODEL_DIR"/Swift-*-IQ3_XXS-00001-of-00002.gguf "$MODEL_DIR"/IQ3_XXS/Swift-*-IQ3_XXS-00001-of-00002.gguf 2>/dev/null | head -1)
@@ -42,16 +50,57 @@ cat /sys/class/power_supply/ADP*/online /sys/class/power_supply/AC*/online 2>/de
 PROBE=$HOME/.local/share/gpu-mode/pcie-probe
 if [[ -x $PROBE ]]; then
     gbs=$("$PROBE" 2>/dev/null || echo 0)
-    if awk -v g="$gbs" 'BEGIN { exit !(g < 5) }'; then
-        echo "strata-agent: PCIe link stuck ($gbs GB/s); retraining..." >&2
-        if sudo -n /usr/local/sbin/gpu-link-retrain >&2 2>/dev/null; then
+    if awk -v g="$gbs" 'BEGIN { exit !(g == 0) }'; then
+        echo "strata-agent: the PCIe probe could not use the GPU (nvidia-smi working? another engine running?)" >&2
+    elif awk -v g="$gbs" 'BEGIN { exit !(g < 5) }'; then
+        if [[ $AUTO_RETRAIN == 1 ]] && sudo -n "$HELPER" >&2 2>/dev/null; then
+            echo "strata-agent: PCIe link was stuck ($gbs GB/s); retrained it (AUTO_RETRAIN=1)" >&2
+            sleep 5   # let the link settle before anything uses the GPU again
             gbs=$("$PROBE" 2>/dev/null || echo 0)
         fi
         if awk -v g="$gbs" 'BEGIN { exit !(g < 5) }'; then
-            echo "strata-agent: WARNING: the link is still slow ($gbs GB/s): run  gpu-mode retrain  and restart" >&2
+            echo "strata-agent: WARNING: the PCIe link is stuck at Gen 1 ($gbs GB/s, should be ~13): prompt reading" \
+                 "will be ~4x slower. Fix: Ctrl-C, run  gpu-mode retrain , start strata-agent again." >&2
         fi
     fi
     echo "strata-agent: PCIe host->GPU $gbs GB/s" >&2
+fi
+
+# ---- while serving: the GPU busy (>= 10% utilization) with the link at Gen 1 in 5 samples in a row (2 s apart).
+# Measured on a healthy link: every busy sample was at Gen 4 (144 of 144 through prompt reading and decoding).
+watch_link() {
+    local util gen n=0 warned=0 fixed=-1000
+    while IFS=', ' read -r util gen; do
+        [[ $util =~ ^[0-9]+$ && $gen =~ ^[0-9]+$ ]] || continue
+        (( util < 10 )) && continue                 # idle: Gen 1 is normal power saving
+        if (( gen > 1 )); then n=0; warned=0; continue; fi
+        (( ++n < 5 )) && continue
+        n=0
+        if [[ $AUTO_RETRAIN == 1 ]] && (( SECONDS - fixed > 300 )) && sudo -n "$HELPER" >/dev/null 2>&1; then
+            fixed=$SECONDS
+            printf '\n*** strata-agent: the PCIe link dropped to Gen 1 while serving; retrained it (AUTO_RETRAIN=1)\n\n' >&2
+        elif (( !warned )); then
+            warned=1
+            printf '\n*** strata-agent: the PCIe link dropped to Gen 1 while serving: prompt reading is ~4x slower now.\n' >&2
+            printf '*** Fix between requests: Ctrl-C, run  gpu-mode retrain , start strata-agent again.\n\n' >&2
+        fi
+    done
+}
+WATCH_PIDS=()
+if [[ $WATCH_LINK == 1 ]] && command -v nvidia-smi >/dev/null; then
+    WDIR=$(mktemp -d)
+    mkfifo "$WDIR/smi"
+    nvidia-smi --query-gpu=utilization.gpu,pcie.link.gen.current --format=csv,noheader,nounits -lms 2000 \
+        > "$WDIR/smi" 2>/dev/null &
+    WATCH_PIDS+=($!)
+    watch_link < "$WDIR/smi" &
+    WATCH_PIDS+=($!)
+    # background jobs of a script ignore Ctrl-C, so stop them on every way out: Ctrl-C, kill, a closed terminal, exit
+    stop_watch() { kill "${WATCH_PIDS[@]}" 2>/dev/null; rm -rf "$WDIR"; }
+    trap stop_watch EXIT
+    trap 'stop_watch; trap - INT; kill -INT $$' INT
+    trap 'stop_watch; exit 143' TERM
+    trap 'stop_watch; exit 129' HUP
 fi
 
 FRONT=()
