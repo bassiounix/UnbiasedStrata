@@ -42,7 +42,9 @@ MODEL_DIR=$MODEL_DIR
 #HOST=127.0.0.1
 #PORT=18090
 #CONTEXT=131072
-#CHUNK=768
+#CHUNK=4096
+# 1 = the experts' RAM copy page-locked (~26% faster prompt reading, ~43 GiB locked in all); 0 = ordinary RAM
+#PIN_EXPERTS=1
 #VISION=1
 #VISION_THREADS=12
 # watch the PCIe link while serving and warn when it drops to Gen 1 (reads nvidia-smi only)

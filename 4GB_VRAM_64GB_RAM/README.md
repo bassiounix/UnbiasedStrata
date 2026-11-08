@@ -8,16 +8,17 @@ system prompts, many turns, images. Everything here was measured on that laptop 
 | What | Result |
 |---|---|
 | Context window | 131,072 tokens (262,144 also works, with slower prompt reading - see [262K](#the-262k-variant)) |
-| Cold read of a 25K-token system prompt | **182-186 tok/s** (~2 min 15 s) |
-| Agent turn with a 2.5-3K-token tool output | 160-172 tok/s (~15-19 s) |
+| Cold read of a 25K-token system prompt | **460-478 tok/s** (52-54 s) |
+| Agent turn with a ~3K-token tool output | 385-394 tok/s (7.6-8.0 s) |
 | Next turn / new conversation with the same system prompt | the prompt is reused from the cache: ~25 new tokens, ~1 s |
-| Fresh prompts of 1K to 75K tokens | 158-184 tok/s |
-| Decode | ~19 tok/s (20.6 near an empty context, 16.3 at 75K tokens) |
+| Fresh prompts of 1K to 75K tokens | 158-184 tok/s with the earlier 768-token chunks (not re-measured at 4096) |
+| Decode | ~17-19 tok/s (with 768-token chunks: 20.6 near an empty context, 16.3 at 75K tokens) |
 | Images | yes: encoded on the CPU, ~8 s for a 260-token picture |
-| VRAM left free while serving | ~110 MiB of 4,096 |
+| VRAM left free while serving | ~220 MiB of 4,096 |
+| RAM | ~43 GiB page-locked (the experts and copies of what the GPU lends out); ~44 GiB must be free at start |
 
 The starting point was an engine that stopped at load with `native head upload: out of memory (236 MiB of 3767 MiB
-VRAM free)` at a 2,048-token context. Getting from there to the table above took six engine changes (all opt-in,
+VRAM free)` at a 2,048-token context. Getting from there to the table above took seven engine changes (all opt-in,
 [listed below](#engine-changes-in-this-fork)), a launcher, and fixing a PCIe link that the NVIDIA driver kept at a
 fraction of its speed.
 
@@ -56,8 +57,8 @@ fraction of its speed.
 | Engine | this fork, branch `4gb-vram` (upstream UnbiasedStrata engine 0.1.45) |
 
 Other 4 GB / 64 GB machines should work the same way. What matters: CUDA compute capability 7.5 or newer (the build
-here is for 8.6), about 44 GiB of RAM free when the engine starts, and a PCIe link that actually runs at its rated
-speed under load (see [the PCIe link problem](#the-pcie-link-problem)).
+here is for 8.6), about 44 GiB of RAM free when the engine starts (about 43 GiB of it is page-locked), and a PCIe link
+that actually runs at its rated speed under load (see [the PCIe link problem](#the-pcie-link-problem)).
 
 ## Quick start
 
@@ -282,8 +283,8 @@ Gen 1.
 - On battery the firmware caps the GPU at 20 W (`enforced.power.limit`), which also keeps the PCIe link at Gen 2 or
   below: plug in the charger. `gpu-mode status` and `strata-agent` warn about it.
 - Once GNOME may use the GPU, an external screen on the HDMI port takes some of the GPU's 4 GB for its images; the
-  configuration here leaves ~110 MiB spare, so a large external screen can make the engine fail to start. Measured
-  with no external screen attached.
+  configuration here leaves ~220 MiB spare at rest. If a screen takes more, the engine steps down to a smaller prompt
+  chunk (3072, 2048, ...) and `strata-agent` says so. Measured with no external screen attached.
 
 ## Step 6 - run
 
@@ -296,13 +297,16 @@ It prints, before and while loading:
 ```
 strata-agent: PCIe host->GPU 13.0 GB/s          # ~13 = healthy; under 5 it warns (see the PCIe link problem)
 strata generate: PCIe probe: 13.0 GB/s host->device ...
-FileExpertSource: pageable resident cache complement ready: resident 39.96 GiB ...   # all experts in RAM
-strata serve: 110 MiB of VRAM free with everything loaded - LOW: ...                 # expected: ignore the advice
+FileExpertSource: ... resident 39.96 GiB ...                                         # all experts in RAM, page-locked
+strata serve: ~220 MiB of VRAM free with everything loaded - LOW: ...                 # expected: ignore the advice
 ... listening on http://127.0.0.1:18090, context 131072 tokens
 ```
 
 The engine's "LOW: add --vram-reserve-mib ..." advice is written for bigger cards; following it does not fit here.
-Loading takes about 40 s (the 40 GiB copy of the experts into RAM is ~30 s of it).
+Loading takes about 50 s (43-59 s over three runs; ~34 s with `PIN_EXPERTS=0`): page-locking the 40 GiB copy of the
+experts is ~42 s of it.
+If the experts cannot be page-locked (not enough free RAM), the engine falls back to ordinary RAM by itself and
+`strata-agent` warns that prompt reading is then ~20% slower.
 
 The server speaks the OpenAI chat API (as llama.cpp's server does): `http://127.0.0.1:18090/v1/chat/completions`,
 model name `swift-iq3_xxs`, streaming and not, plus `/v1/models`, `/health`, `/tokenize`. Images are `image_url`
@@ -310,7 +314,9 @@ parts (data URIs work). Reasoning is on by default; `"chat_template_kwargs": {"e
 per request. One request is served at a time.
 
 Settings: `~/.config/strata-agent.conf`, or the same names in the environment for one run, e.g.
-`PORT=8080 strata-agent`, `VISION=0 strata-agent`, `CONTEXT=262144 CHUNK=128 strata-agent`. Extra arguments are
+`PORT=8080 strata-agent`, `VISION=0 strata-agent`, `PIN_EXPERTS=0 strata-agent`, `CHUNK=2048 strata-agent`. The
+settings are REPO, MODEL_DIR, HOST, PORT, CONTEXT (131072), CHUNK (4096), PIN_EXPERTS (1), VISION (1),
+VISION_THREADS (12), WATCH_LINK (1) and AUTO_RETRAIN (0). Extra arguments are
 passed to the engine. What every engine option and variable in the launcher does is commented in
 [bin/strata-agent](bin/strata-agent) and explained in [How the configuration was found](#how-the-configuration-was-found).
 
@@ -320,15 +326,15 @@ The exact command it runs (with the default settings):
 cd ~/dev/UnbiasedStrata
 M=~/dev/models/swift-iq3_xxs
 SH1=$M/Swift-Qwen3.8-Flash-Next-GSQ-RCO-abliterated-IQ3_XXS-00001-of-00002.gguf
-CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 STRATA_RESIDENT_PIN=0 \
-STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 \
+CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 \
+STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 STRATA_PREFILL_IN_DENSE=1 \
 STRATA_PF_GEMM_SCRATCH_MIB=16 STRATA_PF_GEMM_WS_MIB=4 \
 build/bin/unbiased-strata --engine build/bin/strata -m $SH1 \
   --host 127.0.0.1 --port 18090 --alias swift-iq3_xxs \
   --mmproj $M/mmproj-Qwen3.8-Flash-Next-BF16.gguf --threads 12 \
   -- --pack $M/pack --native $SH1 \
      --expert-profile data/expert-profile.bin --expert-cache 1 --vram-reserve-mib 150 \
-     --prefill 768 --spec 2 --suffix-draft 0 --short-read 0 \
+     --prefill 4096 --spec 2 --suffix-draft 0 --short-read 0 \
      --max-context 131072 --kv q4_0 --kv-resident 20480 --resident-experts --vision
 ```
 
@@ -366,7 +372,8 @@ RAM. Results on the laptop: [Measured results](#measured-results).
 The single biggest factor in prompt-reading speed on a 4 GB card is the PCIe link: the 40 GB of experts live in RAM,
 and every prompt chunk moves a large share of them to the GPU.
 
-**Symptom:** prompt reading ~35-40 tok/s instead of ~150-186; `strata-agent` or the engine prints a PCIe probe of
+**Symptom:** prompt reading ~77 tok/s instead of ~460-480 (with the earlier 768-token chunks: ~35-40 instead of
+~180), and the head and projections take ~2.3 s instead of ~0.17 s to be written back after each prompt; `strata-agent` or the engine prints a PCIe probe of
 ~1 GB/s instead of ~13; `nvidia-smi --query-gpu=pcie.link.gen.current` stays at 1 *under load* (at idle it is
 always 1 - that is normal power saving).
 
@@ -417,8 +424,8 @@ reboot brings it back. So retraining is your decision, made between requests, no
   by default because of the crash above.
 
 How often it happens: on 2026-11-08, after the vfio handoff, once right after boot, once a few minutes after boot,
-and in the afternoon several times within a minute of a healthy start (one run read at 41 tok/s although the start
-measured 13 GB/s).
+in the afternoon several times within a minute of a healthy start (one run read at 41 tok/s although the start
+measured 13 GB/s), and twice more during later runs, once in the middle of plain decoding.
 
 ## How the configuration was found
 
@@ -437,8 +444,14 @@ The card has 3,767 MiB for CUDA. What has to be there at 128K context:
 | Verify window (2 rows) and its graphs, 1 expert cache slot | ~60 MiB |
 | **Left free** | **~110 MiB** |
 
-In RAM: the experts (39.96 GiB, a pageable copy), the K/V of all cells (pinned), the indexer keys and RoPE table
-(pinned), the head's copy (417 MiB, pinned), the vision projector (~1 GB in the front end).
+That table is the 768-token configuration. The current default differs in three ways: with
+`STRATA_PREFILL_IN_DENSE=1` the 300 projection matrices are one 1.6 GiB block (118 MiB less than 300 separate
+allocations), and that block is lent to the prompt path too while a prompt is read; the page-locked experts add
+~80 MiB of page tables; and the prompt path's own part grows with the 4096-token chunk. At rest ~220 MiB is free.
+
+In RAM: the experts (39.96 GiB, page-locked), the K/V of all cells (pinned), the indexer keys and RoPE table (pinned),
+the head's copy (417 MiB, pinned), the projections' copy (1.63 GiB, pinned), the vision projector (~1 GB in the front
+end). About 43 GiB in all is page-locked.
 
 ### From "out of memory at load" to serving
 
@@ -454,6 +467,8 @@ In RAM: the experts (39.96 GiB, a pageable copy), the K/V of all cells (pinned),
 | 8 | `STRATA_PREFILL_IN_HEAD=1` *(new)* | the prompt path's buffers (and its 151 MiB K/V staging pool at 262K) live in the output head's VRAM while a prompt is read; the head is written back from RAM before decoding (34 ms on a healthy link) |
 | 9 | the PCIe link fixed | prompt reading ~40 -> 83 tok/s at the same settings |
 | 10 | 128K context, `--prefill 768`, `STRATA_PF_GEMM_SCRATCH_MIB=16 STRATA_PF_GEMM_WS_MIB=4` *(new)* | a bigger chunk reads faster; the smaller GEMM scratch/workspace (76 MiB) is what makes 768 fit |
+| 11 | `STRATA_PREFILL_IN_DENSE=1` *(new)*, `--prefill 4096` | the dense projections' 1.6 GiB of VRAM is lent to the prompt path too (each layer's projections are streamed into two slots from a pinned copy while a prompt is read, and the block is written back afterwards, ~0.17 s with the head): a 4096-token chunk fits, 182 -> 380 tok/s |
+| 12 | page-locked experts (`STRATA_RESIDENT_PIN` unset, `PIN_EXPERTS=1`) | the GPU copies the experts straight from RAM instead of through CPU staging copies (16 s of a 25K read): 380 -> 462-478 tok/s |
 
 ### Measured results
 
@@ -469,9 +484,12 @@ All on a healthy link (13 GB/s), AC power, the 25K-token agent session (`bench.p
 | 128K context, chunk 768, drafting on | 184.2 tok/s | 18.5 tok/s | 98 MiB | no: verify graph out of memory on the 2nd request |
 | **128K context, chunk 768, drafting off (strata-agent)** | **186.5 tok/s** | **18.8-19.9 tok/s** | **110 MiB** | **yes** |
 | 128K, chunk 768 + MTP (weights in RAM, full head, `--spec 2`) | 182.8 tok/s | 19.4 tok/s (63% of drafts accepted) | 72 MiB | yes |
-| 128K, chunk 1024 or 2048 | - | - | - | does not fit: the engine steps down to 512 |
+| 128K, chunk 1024 or 2048 (without `STRATA_PREFILL_IN_DENSE`) | - | - | - | does not fit: the engine steps down to 512 |
+| 128K, `STRATA_PREFILL_IN_DENSE=1`, chunk 4096, pageable experts | 380 tok/s | 19.6 tok/s | 300 MiB | yes |
+| **128K, `STRATA_PREFILL_IN_DENSE=1`, chunk 4096, page-locked experts (strata-agent now)** | **462-478 tok/s** | **17.2 tok/s** (controlled; 17.3 for the 768 setup on the same prompts) | **220 MiB** | **yes** |
+| the same + `STRATA_PREFILL_EQUAL=1` | 462 tok/s | | | no gain, not used |
 
-The strata-agent configuration through a whole agent session:
+The 768-token configuration (strata-agent's earlier default) through a whole agent session:
 
 | Request | Read fresh | Reused | Read time | Prompt reading | Decode |
 |---|---:|---:|---:|---:|---:|
@@ -487,7 +505,26 @@ same system prompt only reads what is new. `bench.py` results from the final scr
 
 ### Benchmark runs of the final scripts
 
-`install.sh`, then `strata-agent` (which found the link stuck at 1.3 GB/s, retrained it through the helper and started
+**Current default** (chunk 4096, `STRATA_PREFILL_IN_DENSE=1`, page-locked experts), `bench.py agent`:
+
+| Request | Tokens read fresh | Read time | Prompt reading |
+|---|---:|---:|---:|
+| cold: ~25K-token system prompt + task | 24,955 | 54.2 s | 460 tok/s (from count and time) |
+| next turn, same conversation | 22 | 1.0 s | - |
+| new conversation, same system prompt | 27 | 1.0 s | - |
+| agent turn 1: +~2.5K-token tool output | 3,103 | 8.0 s | 391.7 tok/s |
+| agent turn 2 | 2,989 | 7.6 s | 394.2 tok/s |
+| agent turn 3 | 2,897 | 7.6 s | 385.1 tok/s |
+
+Decode with this default: ~17-19 tok/s. With `STRATA_PREFILL_IN_DENSE` on and off at the same chunk size the greedy
+output was byte-identical; a different chunk size changes the rounding, as any chunk change does.
+
+Why it stops near 480: every chunk of more than ~300 tokens touches all 24,576 experts (the top 10 of 512 per token and
+layer), so 42.9 GB crosses PCIe per chunk - 3.3 s at 12.9 GB/s, whatever the chunk size; a bigger chunk spreads it over
+more tokens. At 4096 the GPU's own work is ~1.77 ms per token (a ceiling of ~565 tok/s) and the PCIe wait is ~7 s of a
+51 s read.
+
+**The earlier default** (chunk 768, pageable experts): `install.sh`, then `strata-agent` (which found the link stuck at 1.3 GB/s, retrained it through the helper and started
 at 13.0 GB/s; 108 MiB of VRAM free with vision on), then `bench.py agent` and `bench.py context`, 2026-11-08:
 
 ```
@@ -531,19 +568,18 @@ What did not help, and why:
   4-row verify window does not fit next to a 768-token chunk.
 - **All experts on the GPU** during prompt reading: slower than letting the CPU take a share (the default split).
   On a stuck (Gen 1) link the opposite holds: `STRATA_PREFILL_CPU_SHARE=1` (all to the CPU) was faster there.
-- **Pinned experts** (`STRATA_RESIDENT_PIN=1`): no valid measurement (the link dropped during that run), and it costs
-  ~80 MiB of VRAM.
-- **Bigger chunks** (1024, 2048): do not fit; ~90 MiB short for 1024 at 128K.
+- **Pinned experts, bigger chunks**: at first neither worked (pinning costs ~80 MiB of VRAM, and 1024 was ~90 MiB
+  short at 128K). With `STRATA_PREFILL_IN_DENSE` both fit and both are now the default.
 - **Disabling the GPU's runtime power-off, persistence mode**: did not stop the PCIe link from getting stuck.
 
-GPU utilization during prompt reading is ~50%: the GPU waits for experts to arrive over PCIe and for the CPU's share
-(14 threads busy). 100% is not reachable with the experts in RAM; bigger chunks raise it.
+GPU utilization during prompt reading was ~50% with 768-token chunks: the GPU waits for experts to arrive over PCIe
+and for the CPU's share (14 threads busy). 100% is not reachable with the experts in RAM; bigger chunks raise it.
 
 ## Engine changes in this fork
 
 All opt-in through environment variables; without them the engine behaves as upstream. Greedy outputs were checked
-byte-identical with `STRATA_IDX_HOST` and `STRATA_PREFILL_IN_HEAD` on and off (they move where bytes live, not what is
-computed).
+byte-identical with `STRATA_IDX_HOST`, `STRATA_PREFILL_IN_HEAD` and `STRATA_PREFILL_IN_DENSE` on and off (they move
+where bytes live, not what is computed).
 
 | Variable | File | What it does |
 |---|---|---|
@@ -551,18 +587,17 @@ computed).
 | `STRATA_PREFILL_IN_HEAD=1` | `src/program/generate.cpp`, `src/core/native_head.cpp`, `include/strata/core/native_head.hpp` | the prompt path's buffers are carved inside the native output head's VRAM (the rest allocated beside it); the head's blocks are copied to pinned RAM at start and written back at the same address after every prompt read, so the captured verify graphs stay valid. Needs `--serve`, one GPU, `--short-read 0`, no `--batch`, no `--prefill-head-alias` |
 | `STRATA_PF_GEMM_SCRATCH_MIB=N` (8-64, default 64) | `src/prefill/prefill.cpp` | the prompt path's FP16 dequantization scratch; a smaller one makes the dense GEMMs run in row blocks (same values) |
 | `STRATA_PF_GEMM_WS_MIB=N` (1-32, default 32) | `src/prefill/prefill.cpp` | the prompt path's cuBLAS workspace |
+| `STRATA_PREFILL_IN_DENSE=1` | `src/core/native_dense.cpp`, `include/strata/core/native_dense.hpp`, `src/prefill/prefill.cpp`, `include/strata/prefill/prefill.hpp`, `src/program/generate.cpp` | the 300 native projection matrices in one 1.6 GiB block (118 MiB less than separate allocations), lent to the prompt path while a prompt is read: each layer's projections are streamed into two slots of it from a pinned RAM copy, and the block is written back after the prompt. Needs `STRATA_PREFILL_IN_HEAD=1`, one GPU, no `--mtp`. Greedy output byte-identical on and off at the same chunk size |
 | `STRATA_MTP_EXPERTS_HOST=1` | `src/core/mtp.cpp`, `include/strata/core/mtp.hpp` | the MTP draft layer's 512 experts (675 MiB) in pinned RAM instead of VRAM |
 | `STRATA_MTP_DENSE_HOST=1` | `src/core/mtp.cpp`, `include/strata/core/mtp.hpp` | the MTP draft layer's dense weights (110 MiB) in pinned RAM |
 
 Upstream variables used: `STRATA_HC_REQ8`, `STRATA_RESIDENT_PIN`, `STRATA_PREFILL_CPU_SHARE`, `STRATA_MTP_FULL_HEAD`,
 `STRATA_TRACE=1` (prints the free VRAM after each startup step - the tool used to find all of the above).
 
-MTP, if you want to try it (no speed-up measured):
-
-```bash
-STRATA_MTP_EXPERTS_HOST=1 STRATA_MTP_DENSE_HOST=1 STRATA_MTP_FULL_HEAD=1 \
-strata-agent --mtp ~/dev/models/swift-iq3_xxs/mtp/rt --vram-reserve-mib 50
-```
+MTP (no speed-up measured) does not combine with `STRATA_PREFILL_IN_DENSE`, which `strata-agent` now sets: run the
+engine command from [Step 6](#step-6---run) by hand, without `STRATA_PREFILL_IN_DENSE=1`, with `--prefill 768`, and add
+`STRATA_MTP_EXPERTS_HOST=1 STRATA_MTP_DENSE_HOST=1 STRATA_MTP_FULL_HEAD=1` to the environment and
+`--mtp ~/dev/models/swift-iq3_xxs/mtp/rt --vram-reserve-mib 50` to the engine options.
 
 ## The 262K variant
 
@@ -570,7 +605,9 @@ strata-agent --mtp ~/dev/models/swift-iq3_xxs/mtp/rt --vram-reserve-mib 50
 CONTEXT=262144 CHUNK=128 strata-agent
 ```
 
-The full 262,144-token window works (checked: a passphrase hidden in the middle of a 25,740-token prompt was found;
+Measured before `STRATA_PREFILL_IN_DENSE` and page-locked experts (not re-measured with them; the lent projections
+may allow a bigger chunk than 128 at 262K). The full 262,144-token window works (checked: a passphrase hidden in the
+middle of a 25,740-token prompt was found;
 the follow-up turn reused all 25,748 cached tokens). At 262K the K/V staging pool and the indexer keys grow, so only a
 128-token chunk fits: a cold 25K read is 83 tok/s instead of 186, decode the same. Decode slows as a conversation gets
 long, because the indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 26K tokens, measured
@@ -583,8 +620,9 @@ on the slow link). Prompt-lookup drafting fits at 262K/128 (`strata-agent --suff
 | `native head upload: out of memory` | the engine without this configuration | use `strata-agent` (`STRATA_HC_REQ8=1` and the rest) |
 | `verify: needs the profile-filled VRAM expert tier` | `--expert-cache 0` (= auto) found no room, or the reserve was larger than the free VRAM | `--expert-cache 1` with a reserve below the free VRAM (the launcher's 150) |
 | `verify: instantiate: out of memory` at the first answer | less than ~55-60 MiB free after loading | a smaller chunk, drafting off, no external screen on the NVIDIA GPU |
-| `device buffers for a chunk of N tokens do not fit` and a smaller chunk | the chunk is too big; the engine steps down (e.g. 1024 -> 512 at 128K, much slower) | use `CHUNK=768` at 128K, 128 at 262K |
-| prompt reading ~35-40 tok/s, probe ~1 GB/s | the PCIe link is stuck | `gpu-mode retrain`, restart `strata-agent` ([details](#the-pcie-link-problem)) |
+| `device buffers for a chunk of N tokens do not fit` and a smaller chunk | the chunk is too big for the free VRAM (e.g. an external screen on the NVIDIA GPU); the engine steps down (4096 -> 3072 -> 2048 ...) | free the VRAM, or set the CHUNK that fits |
+| `*** strata-agent: the experts could not be page-locked` | less RAM free than ~44 GiB: the engine fell back to ordinary RAM | close memory-heavy programs and restart (~20% faster prompts), or `PIN_EXPERTS=0` to skip the attempt |
+| prompt reading ~77 tok/s (or ~35-40 with 768-token chunks), probe ~1 GB/s | the PCIe link is stuck | `gpu-mode retrain`, restart `strata-agent` ([details](#the-pcie-link-problem)) |
 | `nvidia-smi`: `Unable to determine the device handle for GPU0 ... Unknown Error`; kernel `NVRM: Xid ... 79, GPU has fallen off the bus` | the GPU crashed (seen once, right after a link retrain) | reboot; then check `gpu-mode status` and the probe |
 | `the whole resident RAM mode does not fit` | less than ~44 GiB available at start; part of the experts is then read from disk | close memory-heavy programs; the engine counts page cache only if the kernel's `MemAvailable` does |
 | the same, inside a container or an app sandbox | a cgroup memory limit counts the page cache of the model files the process read | drop those files' cache before starting (the snippet below) or raise the limit |
