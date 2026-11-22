@@ -8,6 +8,7 @@
 #include "literals.hpp"
 #include "picture_cache.hpp"
 
+#include "server-chat.h"
 #include "server-common.h"
 #include "server-task.h"
 #include "server-queue.h"
@@ -1737,6 +1738,79 @@ void strata_context::init_routes(server_http_context & http) {
         return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_OAI_CHAT, plain);
     };
 
+    // Anthropic Messages API (Claude Code and other Anthropic clients): the request is converted to a chat completion
+    // (llama.cpp's converter) and answered in Anthropic's format, streamed or not.  Only this server's model is
+    // accepted: a client that names another model (a Claude model, after a model switch) gets an error instead of
+    // an answer from this one.  System messages after the first become user messages (templates allow one, first).
+    // Effort: output_config.effort low / medium kept, high / xhigh / max -> xhigh (the template's levels are none,
+    // low, medium and xhigh); "thinking": {"type": "disabled"} -> none.
+    auto anthropic_to_chat = [I](const json & anthropic, json & body) -> std::string {
+        const std::string model = json_value(anthropic, "model", std::string());
+        if (!model.empty()) {
+            auto lower = [](std::string v) { std::transform(v.begin(), v.end(), v.begin(), ::tolower); return v; };
+            const std::string m = lower(model), own = lower(I->model_name);
+            const size_t slash = m.rfind('/');
+            if (m != own && (slash == std::string::npos || m.substr(slash + 1) != own)) {
+                return "model '" + model + "' is not served here: this server serves '" + I->model_name + "'";
+            }
+        }
+        body = server_chat_convert_anthropic_to_oai(anthropic);
+        // Anthropic allows system messages inside the conversation (Claude Code puts its environment block after the
+        // first user message); chat templates allow one, first.  A later one is sent as a user message: folding it
+        // into the system prompt would make that prompt differ per folder and miss the cached prefix.
+        if (body.contains("messages") && body.at("messages").is_array()) {
+            json & msgs = body.at("messages");
+            for (size_t i = 1; i < msgs.size(); i++) {
+                if (msgs[i].is_object() && json_value(msgs[i], "role", std::string()) == "system") {
+                    msgs[i]["role"] = "user";
+                }
+            }
+        }
+        const json thinking = json_value(anthropic, "thinking", json::object());
+        const json output_config = json_value(anthropic, "output_config", json::object());
+        const std::string effort = json_value(output_config, "effort", std::string());
+        if (thinking.is_object() && json_value(thinking, "type", std::string()) == "disabled") {
+            body["reasoning_effort"] = "none";
+        } else if (effort == "low" || effort == "medium") {
+            body["reasoning_effort"] = effort;
+        } else if (effort == "high" || effort == "xhigh" || effort == "max") {
+            body["reasoning_effort"] = "xhigh";
+        }
+        return "";
+    };
+
+    auto post_anthropic_messages = [I, parse_chat, anthropic_to_chat](const server_http_req & req) {
+        std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
+        json body;
+        const std::string err = anthropic_to_chat(json::parse(req.body), body);
+        if (!err.empty()) {
+            auto res = I->create_response();
+            res->error(format_error_response(err, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        I->move_system_tags(body);   // --system-tags-to-user
+        json body_parsed = parse_chat(body, files, plain);
+        return I->handle_completions(req, body_parsed, files, TASK_RESPONSE_TYPE_ANTHROPIC, plain);
+    };
+
+    auto post_anthropic_count_tokens = [I, parse_chat, anthropic_to_chat](const server_http_req & req) {
+        auto res = I->create_response();
+        std::vector<raw_buffer> files;
+        std::vector<std::pair<size_t, size_t>> plain;
+        json body;
+        const std::string err = anthropic_to_chat(json::parse(req.body), body);
+        if (!err.empty()) {
+            res->error(format_error_response(err, ERROR_TYPE_NOT_FOUND));
+            return res;
+        }
+        I->move_system_tags(body);
+        const json data = parse_chat(body, files, plain);
+        const llama_tokens tokens = tokenize_mixed(I->vocab, data.at("prompt"), true, true);
+        res->ok({{"input_tokens", tokens.size()}});
+        return res;
+    };
+
     auto post_completions_oai = [I](const server_http_req & req) {
         std::vector<raw_buffer> files;
         const json body = json::parse(req.body);
@@ -1873,6 +1947,8 @@ void strata_context::init_routes(server_http_context & http) {
     http.post("/v1/completions",      ex_wrapper(post_completions_oai));
     http.post("/chat/completions",    ex_wrapper(post_chat_completions));
     http.post("/v1/chat/completions", ex_wrapper(post_chat_completions));
+    http.post("/v1/messages",         ex_wrapper(post_anthropic_messages));
+    http.post("/v1/messages/count_tokens", ex_wrapper(post_anthropic_count_tokens));
     http.post("/tokenize",            ex_wrapper(post_tokenize));
     http.post("/detokenize",          ex_wrapper(post_detokenize));
     http.post("/apply-template",      ex_wrapper(post_apply_template));

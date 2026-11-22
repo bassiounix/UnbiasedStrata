@@ -171,6 +171,21 @@ echo "$lit" | sed 's/^/     /'
 check $rc "control-token texts inside messages are text (literals)"
 check $(grep -q "control-token texts inside the messages are sent as text" "$TPL_LOG" && echo 0 || echo 1) "server logged the literals"
 
+# Anthropic Messages API (/v1/messages, Claude Code): non-streaming, streaming, count_tokens, another model refused
+a=$(curl -s "$URL/v1/messages" -H 'content-type: application/json' -H 'anthropic-version: 2023-06-01' -d '{"model":"fake","max_tokens":32,"system":"Be brief.","messages":[{"role":"user","content":"Say hello"}],"output_config":{"effort":"high"}}')
+check $([ "$(echo "$a" | j 'd["type"]')" = message ] && [ "$(echo "$a" | j '"".join(c.get("text","") for c in d["content"] if c["type"]=="text")')" = "Hello, world!" ] && [ "$(echo "$a" | j 'd["stop_reason"]')" = end_turn ] && echo 0 || echo 1) "anthropic message: $(echo "$a" | j '{"type": d.get("type"), "stop": d.get("stop_reason"), "usage": d.get("usage")}')"
+as=$(curl -s -N "$URL/v1/messages" -H 'content-type: application/json' -d '{"model":"fake","max_tokens":32,"stream":true,"messages":[{"role":"user","content":"Say hello"}]}')
+ajoined=$(echo "$as" | grep '^data: {' | sed 's/^data: //' | python3 -c 'import json,sys; print("".join(e["delta"].get("text","") for e in map(json.loads, sys.stdin) if e.get("type")=="content_block_delta"), end="")')
+check $([ "$ajoined" = "Hello, world!" ] && echo "$as" | grep -q '^event: message_stop' && echo 0 || echo 1) "anthropic stream: text deltas join to the content, ends with message_stop"
+ac=$(curl -s "$URL/v1/messages/count_tokens" -H 'content-type: application/json' -d '{"model":"fake","messages":[{"role":"user","content":"Say hello"}]}')
+check $([ "$(echo "$ac" | j 'd["input_tokens"] > 0')" = true ] && echo 0 || echo 1) "anthropic count_tokens: $ac"
+aw=$(curl -s -o /dev/null -w '%{http_code}' "$URL/v1/messages" -H 'content-type: application/json' -d '{"model":"claude-opus-5-5","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}')
+check $([ "$aw" = 404 ] && echo 0 || echo 1) "anthropic request for another model -> $aw"
+# Claude Code's shape: system blocks, then a system message after the first user message, which a template that
+# allows one system message, first (the Qwen3 one), would refuse
+am=$(curl -s "$TPL_URL/v1/messages" -H 'content-type: application/json' -d '{"model":"fake","max_tokens":8,"system":[{"type":"text","text":"You are Claude Code."},{"type":"text","text":"Be brief."}],"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"hi"}]},{"role":"system","content":[{"type":"text","text":"# Environment\ncwd: /tmp"}]}],"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}')
+check $([ "$(echo "$am" | j 'd["type"]')" = message ] && echo 0 || echo 1) "anthropic system message mid-conversation: $(echo "$am" | j 'd.get("type") or d.get("error",{}).get("message","")[:80]')"
+
 # tokenize / detokenize round trip
 t=$(curl -s "$URL/tokenize" -H 'content-type: application/json' -d '{"content":"Hello, world!"}' | j 'd["tokens"]')
 d=$(curl -s "$URL/detokenize" -H 'content-type: application/json' -d "{\"tokens\":$t}" | j 'd["content"]')
