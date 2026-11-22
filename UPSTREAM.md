@@ -73,7 +73,12 @@ Recorded here because a client written for one of the two may notice.
 - **Streams always end with a usage chunk** (empty `choices`, `usage`, `timings`), as upstream's server does,
   whether or not the client sent `stream_options.include_usage`; llama-server sends it only on request (96f4ef1f).
   Same reason: the bench client reads `prompt_tokens` from it.
-- **One slot.** Requests are served one at a time in arrival order, as upstream's server does with one engine.
+- **One slot, several requests in turns.** The engine runs one request at a time. By default (with the engine parking
+  conversations) several are in flight at once and take turns of `--slice-ms` of decoding: the running one is
+  stopped (`STOP`), the engine keeps its conversation exactly at the tokens it sent and parks it when the next request
+  is another conversation, and its next turn sends the prompt plus those tokens, which the engine continues from the
+  parked state. Upstream's server queued them, or decoded them together in `--batch` slots (`BGEN`), which this front
+  end does not drive. `--parallel 1` is upstream's queue.
 - **No constrained decoding.** `response_format` and tool schemas are parsed and used for output parsing, not
   enforced at the sampler, because the engine samples; logged once per such request.
 - **Pictures are encoded in the front end** (`--mmproj FILE`, commit 71886db0 and after): llama.cpp's mtmd runs the

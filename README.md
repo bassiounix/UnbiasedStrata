@@ -100,7 +100,12 @@ option (`--host`, `--port`, `--api-key`, `--alias`, `--temp`, `--top-k`, `--top-
 engine, which is started as a child process with `--serve` added and spoken to over its line protocol
 ([docs/BACKENDS.md](docs/BACKENDS.md)). Where the model ends up (GPU cache, pinned RAM, SSD) and the three expert
 modes: [docs/MEMORY_LAYOUT.md](docs/MEMORY_LAYOUT.md). The server answers `/v1/chat/completions` (streaming and not), `/v1/models`,
-`/health`, `/props`, `/tokenize`, `/detokenize`, as llama.cpp's server does, one request at a time.
+`/health`, `/props`, `/tokenize`, `/detokenize`, as llama.cpp's server does. The engine runs one request at a time.
+With `--parallel N` (llama-server's `-np`) up to N requests are in flight and all stream: they take turns on the
+engine, `--slice-ms` (default 8000) of decoding each, and a paused answer goes on from the conversation the engine
+parked (`--conversation-cache-mib` in the engine's options), nothing read again. The default is the engine's
+`--conversation-cache-slots` when it parks, else 1 (one at a time, the others queued without an answer until their
+turn). A new request still reads its prompt in its own turn, and a prompt being read is not interrupted.
 
 ```
 build/bin/unbiased-strata --engine build/bin/strata-poly \

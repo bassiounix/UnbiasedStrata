@@ -15,6 +15,10 @@ Environment variables choose the answers, so one script covers the cases:
   FAKE_DIE_AFTER  if set, exit 3 after emitting this many tokens of the first request
   FAKE_NO_STOP    if set, READY without "stop": STOP is ignored and the request runs to its end
   FAKE_PROMPT_N   if set, lie about the prompt size in DONE (mismatch test)
+  FAKE_RESUME     if set, a prompt that ends with the start of the answer continues it (the front end's --parallel
+                  turns resend the prompt plus the tokens so far), and DONE reports all but its last token reused
+  FAKE_FORGET     with FAKE_RESUME: report nothing reused when continuing (an engine that could not park the answer)
+  FAKE_LOG        if set, append "GEN <prompt_n> <max_new> <continued> <produced> <finish>" per request to this file
 """
 import os
 import select
@@ -79,14 +83,27 @@ while True:
     if env("FAKE_ERR"):
         say("ERR " + env("FAKE_ERR"))
         continue
-    say("RESUME 0")
-    say("PP %d %d 1 1000" % (prompt_n, prompt_n))
+    continued = 0
     if env("FAKE_N_TOKENS"):
-        tokens = [int(env("FAKE_TOKEN_ID", "100"))] * int(env("FAKE_N_TOKENS"))
+        tid = int(env("FAKE_TOKEN_ID", "100"))
+        n = int(env("FAKE_N_TOKENS"))
+        if env("FAKE_RESUME"):
+            while continued < min(n, prompt_n) and prompt[prompt_n - 1 - continued] == tid:
+                continued += 1
+        tokens = [tid] * (n - continued)
     elif env("FAKE_TOKENS"):
         tokens = [int(x) for x in env("FAKE_TOKENS").split(",") if x]
+        if env("FAKE_RESUME"):
+            for k in range(min(len(tokens), prompt_n), 0, -1):
+                if prompt[prompt_n - k:] == tokens[:k]:
+                    continued = k
+                    break
+            tokens = tokens[continued:]
     else:
         tokens = prompt
+    reused = prompt_n - 1 if continued and not env("FAKE_FORGET") else 0
+    say("RESUME %d" % reused)
+    say("PP %d %d 1 1000" % (prompt_n, prompt_n))
     delay = float(env("FAKE_DELAY_MS", "0")) / 1000.0
     die_after = int(env("FAKE_DIE_AFTER", "0") or 0)
     produced = 0
@@ -105,5 +122,8 @@ while True:
         if delay:
             time.sleep(delay)
     first = False
+    if env("FAKE_LOG"):
+        with open(env("FAKE_LOG"), "a") as f:
+            f.write("GEN %d %d %d %d %s\n" % (prompt_n, max_new, continued, produced, finish))
     # DONE <generated> <prompt> <prompt_ms> <decode_ms> <finish> <drafts_accepted> <drafts_offered> <reused>
-    say("DONE %d %s 12.5 %.1f %s 0 0 0" % (produced, env("FAKE_PROMPT_N", str(prompt_n)), produced * 10.0, finish))
+    say("DONE %d %s 12.5 %.1f %s 0 0 %d" % (produced, env("FAKE_PROMPT_N", str(prompt_n)), produced * 10.0, finish, reused))

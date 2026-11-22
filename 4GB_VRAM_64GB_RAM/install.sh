@@ -59,6 +59,10 @@ MODEL_DIR=$MODEL_DIR
 # caching across conversations and restarts (README: Several requests, and caching ...)
 #PARK_MIB=6144
 #PARK_SLOTS=4
+# requests in flight at once (parallel agents and chats; they take turns on the engine, SLICE_MS of decoding each).
+# Empty: as many as PARK_SLOTS (1 with PARK_MIB=0)
+#PARALLEL=
+#SLICE_MS=8000
 #PREFIX_CACHE=1
 #MOVE_TAGS=cwd,env
 #SESSION_DIR=$HOME/.cache/strata-agent/sessions

@@ -33,6 +33,7 @@
 #include <atomic>
 #include <cinttypes>
 #include <cstdio>
+#include <deque>
 #include <mutex>
 #include <set>
 #include <chrono>
@@ -51,13 +52,26 @@ constexpr int ENGINE_POLL_MS = 20;
 // REGINA-112: every request without max_tokens got a 500 until the front end counted it)
 constexpr int ENGINE_CONTEXT_RESERVE = 8;
 
-// mirrors server_slot in server-context.cpp, for the one slot the engine is
+// mirrors server_slot in server-context.cpp: one request in flight. The engine runs one at a time (`slot` in
+// strata_context_impl); with --parallel N the others in flight wait in `ready`, not yet started or paused.
 struct Slot {
     std::unique_ptr<server_task> task;
 
-    bool started    = false; // GEN written
+    bool started    = false; // GEN written for the current turn on the engine
     bool cancelled  = false; // the client went away: STOP sent, output is drained, no final result
     bool stop_sent  = false; // STOP sent for our own reason (stop string, limit); the final result is still sent
+    bool pausing    = false; // STOP sent to give the engine to another request; DONE cancel then pauses this one
+
+    // --parallel: a request runs in turns. The first reads the prompt; when another request waits and this one has
+    // decoded for --slice-ms it is paused (STOP: the engine keeps its conversation exactly at the tokens it sent,
+    // and parks it when the next request is another conversation), and a later turn sends the prompt plus every token
+    // so far, which the engine continues from its parked or live state instead of reading the history again.
+    int                  turns = 0;        // GEN lines written for this request
+    std::vector<int32_t> ids;              // the prompt as the engine reads it (pictures as image_pad runs)
+    llama_tokens         emitted;          // every token the engine sent for this request
+    int64_t              n_sent = 0;       // the prompt size of the current turn's GEN (DONE must report it)
+    int64_t              slice_from_ms = 0; // the current turn's first token (0: still reading)
+    int64_t              last_result_ms = 0; // the last result sent to its HTTP thread (wake_readers)
 
     std::string  generated_text;
     llama_tokens generated_tokens;
@@ -210,7 +224,27 @@ struct strata_context_impl {
     long long                n_ctx = 0;
     std::atomic<bool>        engine_dead{false};
 
-    Slot slot;
+    Slot slot;   // the request on the engine
+
+    // --parallel N (llama-server's -np): up to N requests in flight at once; the engine still runs one, so they take
+    // turns of --slice-ms of decoding each (see Slot). More than N wait in the queue (deferred), as before. 1: one
+    // request at a time, the others queued without an answer until their turn.
+    std::deque<Slot>  ready;               // in flight, not on the engine: not started yet, or paused (oldest first)
+    int               max_inflight = 1;
+    int64_t           slice_ms     = 8000; // --slice-ms; 0: never pause, run them one after another
+    std::atomic<int>  n_inflight{0};       // for /health, read on the HTTP threads
+    // a later turn read its conversation again: the engine had no room to park it (its RAM floor, the cache's size), so
+    // a pause costs a history read instead of saving one. Turns stop for a while: the requests in flight run one after
+    // another (as without --parallel, but with their streams open) until this time.
+    int64_t           turns_off_until_ms = 0;
+    static constexpr int64_t TURNS_OFF_MS = 5 * 60 * 1000;
+
+    int inflight() const {
+        return (slot.active() ? 1 : 0) + (int) ready.size();
+    }
+    void count_inflight() {
+        n_inflight = inflight();
+    }
 
     // ---- session files and the system prompt on disk --------------------------------------------------------------
     // --slot-save-path DIR (absolute, ends with '/'): llama-server's POST /slots/0?action=save|restore, as the engine's
@@ -428,22 +462,24 @@ struct strata_context_impl {
         (void) is_yielding; // never yields: the engine is not driven from this process
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
-                if (slot.active()) {
+                if (inflight() >= max_inflight) {
                     queue_tasks.defer(std::move(task));
                     return true;
                 }
-                launch(std::move(task));
+                admit(std::move(task));
                 return true;
 
             case SERVER_TASK_TYPE_CANCEL:
                 if (slot.active() && slot.task->id == task.id_target) {
                     cancel_current();
+                } else {
+                    cancel_waiting(task.id_target);
                 }
                 return true;
 
             case SERVER_TASK_TYPE_SLOT_SAVE:
             case SERVER_TASK_TYPE_SLOT_RESTORE:
-                if (slot.active()) {   // between requests only: it waits for the running one
+                if (inflight() > 0) {   // between requests only: it waits until none is in flight
                     queue_tasks.defer(std::move(task));
                     return true;
                 }
@@ -456,7 +492,7 @@ struct strata_context_impl {
             case SERVER_TASK_TYPE_METRICS: {
                 auto res = std::make_unique<server_task_result_metrics>();
                 res->id = task.id;
-                res->n_processing_slots = slot.active() ? 1 : 0;
+                res->n_processing_slots = inflight();
                 res->n_tasks_deferred   = (int) queue_tasks.queue_tasks_deferred_size();
                 res->metrics            = metrics;
                 queue_results.send(std::move(res));
@@ -494,53 +530,90 @@ struct strata_context_impl {
                 break;
             }
         }
+        maybe_pause();
+        wake_readers();
+    }
+
+    // llama.cpp's server_response::recv_with_timeout restarts its 1 s wait whenever ANY result arrives, so while one
+    // request streams, the HTTP thread of another in flight never times out: it would not see its client leave (a
+    // waiting request would get a turn, a prompt read, for nobody) nor send its SSE pings. Every second without a result
+    // each one in flight gets an empty one (a partial marked is_begin, which handle_completions skips), and its thread
+    // goes round its checks.
+    void wake_readers() {
+        if (max_inflight <= 1 || inflight() <= 1) {
+            return;
+        }
+        const int64_t now = Engine::now_ms();
+        auto wake = [&](Slot & s) {
+            if (!s.active() || s.cancelled || now - s.last_result_ms < 1000) {
+                return;
+            }
+            s.last_result_ms = now;
+            auto res = std::make_unique<server_task_result_cmpl_partial>();
+            res->id       = s.task->id;
+            res->index    = s.task->index;
+            res->is_begin = true;
+            res->res_type = s.task->params.res_type;
+            queue_results.send(std::move(res));
+        };
+        wake(slot);
+        for (Slot & s : ready) {
+            wake(s);
+        }
+    }
+
+    // --parallel: the running request has decoded for its slice and another waits - STOP it; its DONE cancel pauses
+    // it (on_done) and the next one starts. Not while it reads its prompt (a prompt read stopped inside a chunk is
+    // lost), nor when it is ending anyway.
+    void maybe_pause() {
+        if (!slot.active() || !slot.started || ready.empty() || slice_ms <= 0 || slot.slice_from_ms == 0 ||
+            slot.pausing || slot.cancelled || slot.stop_sent || !slot.has_next_token || !engine.can_stop()) {
+            return;
+        }
+        const int64_t now = Engine::now_ms();
+        if (now - slot.slice_from_ms < slice_ms || now < turns_off_until_ms) {
+            return;
+        }
+        SRV_INF("task %d: paused after %d tokens, %zu other request%s waiting\n", slot.task->id, (int) slot.stats.n_gen,
+                ready.size(), ready.size() == 1 ? "" : "s");
+        slot.pausing = true;
+        if (!engine.stop()) {
+            slot.pausing = false;   // the engine is gone; the supervisor will report it
+        }
     }
 
     // ---- one request --------------------------------------------------------------------------------------------
 
-    // mirrors launch_slot_with_task
-    void launch(server_task && task) {
-        slot.release();
-        slot.task = std::make_unique<server_task>(std::move(task));
-        const server_task & t = *slot.task;
+    // mirrors launch_slot_with_task, in two parts: admit() checks the request and makes it one in flight (with
+    // --parallel the stream's headers go out at once, so a client does not wait for them while others run);
+    // run_turn() writes its GEN when it is its turn on the engine
+    void admit(server_task && task) {
+        Slot s;
+        s.task = std::make_unique<server_task>(std::move(task));
+        const server_task & t = *s.task;
 
         if (!engine.alive()) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
-            slot.release();
             return;
         }
-
         const int32_t n_prompt = t.n_tokens();
         if (n_prompt == 0) {
             send_error(t, "the prompt is empty", ERROR_TYPE_INVALID_REQUEST);
-            slot.release();
             return;
-        }
-        std::vector<int32_t> ids;
-        if (t.tokens.has_mtmd) {
-            std::string ierr;
-            if (!encode_pictures(t, ids, ierr)) {
-                send_error(t, ierr, ERROR_TYPE_SERVER);
-                slot.release();
-                return;
-            }
-        } else {
-            ids = t.tokens.get_text_tokens();
         }
         const long long room = n_ctx - n_prompt - ENGINE_CONTEXT_RESERVE;
         if (room <= 0) {
             send_error(t, string_format("the request exceeds the available context size: %d prompt tokens, context %lld (%d kept back)",
                                         n_prompt, n_ctx, ENGINE_CONTEXT_RESERVE), ERROR_TYPE_EXCEED_CONTEXT_SIZE);
-            slot.release();
             return;
         }
         // n_predict: -1 and anything past the context become what is left, as llama-server does
-        slot.n_predict = t.params.n_predict;
-        if (slot.n_predict < 0 || slot.n_predict > room) {
-            if (slot.n_predict > room) {
-                SRV_WRN("n_predict %d exceeds the room left in the context, lowered to %lld\n", slot.n_predict, room);
+        s.n_predict = t.params.n_predict;
+        if (s.n_predict < 0 || s.n_predict > room) {
+            if (s.n_predict > room) {
+                SRV_WRN("n_predict %d exceeds the room left in the context, lowered to %lld\n", s.n_predict, room);
             }
-            slot.n_predict = (int32_t) room;
+            s.n_predict = (int32_t) room;
         }
         if (!t.params.sampling.grammar.grammar.empty()) {
             // the engine samples inside its own process and exposes no logits: a grammar (tools, json_schema,
@@ -548,39 +621,112 @@ struct strata_context_impl {
             SRV_WRN("task %d: a grammar was requested (%zu chars); this engine does not constrain sampling, parsing only\n",
                     t.id, t.params.sampling.grammar.grammar.size());
         }
+        if (t.params.stream) {
+            // the HTTP side sends the 200 and the stream headers on this, before the first token
+            send_partial_response(s, completion_token_output{}, /* is_progress */ false, /* is_begin */ true);
+        }
+        if (!slot.active()) {
+            slot = std::move(s);
+            run_turn();
+        } else {
+            SRV_INF("task %d: in flight, waiting for its turn (%zu ahead)\n", t.id, ready.size() + 1);
+            ready.push_back(std::move(s));
+        }
+        count_inflight();
+    }
 
-        std::string header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
-        // --prefix-file: a long system prompt the file does not hold yet pins its end (the engine's root checkpoint)
-        // and the session is saved after the answer; at most once per PREFIX_SAVE_GAP_MS, so two alternating system
-        // prompts do not write a file per request. Only this request pins: a pin on later requests would keep the
-        // engine from parking the conversation a new chat leaves (generate.cpp pin_sibling).
-        pending_pin = -1;
-        if (!prefix_file.empty() && !session_dir.empty()) {
-            const int64_t end = system_prompt_end(ids);
-            if (end > 0) {
-                const uint64_t h = hash_tokens(ids, (size_t) end);
-                if (h != saved_prefix_hash &&
-                    (prefix_saved_at_ms == 0 || Engine::now_ms() - prefix_saved_at_ms >= PREFIX_SAVE_GAP_MS)) {
-                    pending_pin      = end;
-                    pending_pin_hash = h;
-                    // right after `GEN <max_new>`: a GENI header ends with `image_pad=<id> <file>`
-                    const size_t at = header.find(' ', header.find(' ') + 1);
-                    header.insert(at == std::string::npos ? header.size() : at, " pin=" + std::to_string(end));
+    // the next turn of `slot` on the engine: the first reads the prompt, a later one continues a paused answer.
+    // Returns false when it could not start; the error is sent and the slot released.
+    bool run_turn() {
+        const server_task & t = *slot.task;
+        if (!engine.alive()) {
+            send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
+            slot.release();
+            return false;
+        }
+        std::string header;
+        std::vector<int32_t> ids;
+        if (slot.turns == 0) {
+            if (t.tokens.has_mtmd) {
+                std::string ierr;
+                if (!encode_pictures(t, ids, ierr)) {
+                    send_error(t, ierr, ERROR_TYPE_SERVER);
+                    slot.release();
+                    return false;
+                }
+            } else {
+                ids = t.tokens.get_text_tokens();
+            }
+            if (max_inflight > 1) {
+                slot.ids = ids;   // kept for a later turn
+            }
+            header = gen_header(t, slot.n_predict, slot.images_path, slot.image_keys);
+            // --prefix-file: a long system prompt the file does not hold yet pins its end (the engine's root checkpoint)
+            // and the session is saved after the answer; at most once per PREFIX_SAVE_GAP_MS, so two alternating system
+            // prompts do not write a file per request. Only this request pins: a pin on later requests would keep the
+            // engine from parking the conversation a new chat leaves (generate.cpp pin_sibling).
+            pending_pin = -1;
+            if (!prefix_file.empty() && !session_dir.empty()) {
+                const int64_t end = system_prompt_end(ids);
+                if (end > 0) {
+                    const uint64_t h = hash_tokens(ids, (size_t) end);
+                    if (h != saved_prefix_hash &&
+                        (prefix_saved_at_ms == 0 || Engine::now_ms() - prefix_saved_at_ms >= PREFIX_SAVE_GAP_MS)) {
+                        pending_pin      = end;
+                        pending_pin_hash = h;
+                        // right after `GEN <max_new>`: a GENI header ends with `image_pad=<id> <file>`
+                        const size_t at = header.find(' ', header.find(' ') + 1);
+                        header.insert(at == std::string::npos ? header.size() : at, " pin=" + std::to_string(end));
+                    }
                 }
             }
+        } else {
+            // a paused answer goes on: the prompt and every token so far, the rest of the budget (the engine holds
+            // all but the last token, live or parked, and reads that one)
+            ids = slot.ids;
+            ids.insert(ids.end(), slot.emitted.begin(), slot.emitted.end());
+            header = gen_header(t, slot.n_predict - (int32_t) slot.stats.n_gen, slot.images_path, slot.image_keys);
         }
         if (!engine.send_request(header, ids)) {
             send_error(t, "the engine is not running", ERROR_TYPE_UNAVAILABLE);
             slot.release();
-            return;
+            return false;
         }
-        slot.started = true;
-        slot.stats.update_prompt_start();
-        SRV_INF("task %d: %s prompt=%d n_predict=%d\n", t.id, header.c_str(), n_prompt, slot.n_predict);
+        slot.started       = true;
+        slot.turns        += 1;
+        slot.n_sent        = (int64_t) ids.size();
+        slot.slice_from_ms = 0;
+        if (slot.turns == 1) {
+            slot.stats.update_prompt_start();   // the time to the first token counts from here, not from admission
+            SRV_INF("task %d: %s prompt=%d n_predict=%d\n", t.id, header.c_str(), t.n_tokens(), slot.n_predict);
+        } else {
+            SRV_INF("task %d: resumed (turn %d) after %d tokens: %zu tokens sent, up to %d more\n", t.id, slot.turns,
+                    (int) slot.stats.n_gen, ids.size(), slot.n_predict - (int) slot.stats.n_gen);
+        }
+        return true;
+    }
 
-        if (t.params.stream) {
-            // the HTTP side sends the 200 and the stream headers on this, before the first token
-            send_partial_response(completion_token_output{}, /* is_progress */ false, /* is_begin */ true);
+    // the oldest request in flight that is not on the engine takes it
+    void run_next() {
+        while (!slot.active() && !ready.empty()) {
+            slot = std::move(ready.front());
+            ready.pop_front();
+            run_turn();
+        }
+        count_inflight();
+    }
+
+    // a client that went away before its request reached the engine, or while it was paused
+    void cancel_waiting(int id_task) {
+        for (auto it = ready.begin(); it != ready.end(); ++it) {
+            if (it->task && it->task->id == id_task) {
+                SRV_INF("task %d: cancelled by the client while waiting for its turn\n", id_task);
+                it->release();
+                ready.erase(it);
+                count_inflight();
+                queue_tasks.pop_deferred_task(-1);
+                return;
+            }
         }
     }
 
@@ -883,7 +1029,7 @@ struct strata_context_impl {
         slot.cancelled = true;
         if (!engine.stop()) {
             // the engine is gone; the supervisor will report it
-            slot.release();
+            finish_slot();
         }
     }
 
@@ -895,13 +1041,17 @@ struct strata_context_impl {
                 }
                 break;
 
-            case EngineLine::RESUME:
-                slot.stats.n_prompt_cached = (uint64_t) line.n;
+            case EngineLine::RESUME:   // before the engine reads: this many tokens of the prompt are reused
+                if (slot.turns == 1) {
+                    slot.stats.n_prompt_cached = (uint64_t) line.n;
+                } else {
+                    check_resumed(slot.n_sent - line.n);
+                }
                 break;
 
             case EngineLine::PP:
-                if (!slot.cancelled && slot.task->params.stream && slot.task->params.return_progress) {
-                    send_partial_response(completion_token_output{}, /* is_progress */ true, false, line.pp_done);
+                if (slot.turns == 1 && !slot.cancelled && slot.task->params.stream && slot.task->params.return_progress) {
+                    send_partial_response(slot, completion_token_output{}, /* is_progress */ true, false, line.pp_done);
                 }
                 break;
 
@@ -948,6 +1098,12 @@ struct strata_context_impl {
         if (slot.stats.n_gen == 0) {
             slot.stats.update_prompt_last();
         }
+        if (slot.slice_from_ms == 0) {
+            slot.slice_from_ms = Engine::now_ms();   // this turn's slice counts from its first token
+        }
+        if (max_inflight > 1) {
+            slot.emitted.push_back(tok);
+        }
         slot.stats.n_gen++;
         slot.stats.update_gen_last();
 
@@ -986,7 +1142,7 @@ struct strata_context_impl {
                 result.text_to_send = "";
             }
             if (slot.task->params.stream) {
-                send_partial_response(result, false, false);
+                send_partial_response(slot, result, false, false);
             }
         }
 
@@ -1018,9 +1174,10 @@ struct strata_context_impl {
         SRV_INF("task %d: DONE produced=%lld prompt=%lld prompt_ms=%.1f decode_ms=%.1f finish=%s drafts=%lld/%lld reused=%lld\n",
                 t.id, d.produced, d.prompt_n, d.prompt_ms, d.decode_ms, d.finish.c_str(), d.draft_accepted, d.draft_offered, d.reused);
 
-        if (d.prompt_n != (long long) t.n_tokens()) {
+        if (d.prompt_n != slot.n_sent) {
             // the engine answered for another prompt: never pass that off as this request's reply
-            SRV_ERR("task %d: engine prompt size mismatch: sent %d, engine reports %lld; refusing the response\n", t.id, t.n_tokens(), d.prompt_n);
+            SRV_ERR("task %d: engine prompt size mismatch: sent %lld, engine reports %lld; refusing the response\n", t.id,
+                    (long long) slot.n_sent, d.prompt_n);
             if (!slot.cancelled) {
                 send_error(t, "engine response prompt size mismatch", ERROR_TYPE_SERVER);
             }
@@ -1028,10 +1185,12 @@ struct strata_context_impl {
             return;
         }
 
-        slot.stats.n_prompt_cached    = (uint64_t) std::max<long long>(d.reused, (long long) slot.stats.n_prompt_cached);
-        slot.stats.n_prompt_processed = (uint64_t) std::max<long long>(0, d.prompt_n - (long long) slot.stats.n_prompt_cached);
-        slot.stats.n_draft_tokens     = (uint64_t) d.draft_offered;
-        slot.stats.n_draft_accepted   = (uint64_t) d.draft_accepted;
+        if (slot.turns == 1) {
+            slot.stats.n_prompt_cached    = (uint64_t) std::max<long long>(d.reused, (long long) slot.stats.n_prompt_cached);
+            slot.stats.n_prompt_processed = (uint64_t) std::max<long long>(0, d.prompt_n - (long long) slot.stats.n_prompt_cached);
+        }
+        slot.stats.n_draft_tokens   += (uint64_t) d.draft_offered;
+        slot.stats.n_draft_accepted += (uint64_t) d.draft_accepted;
         if (slot.stats.t_prompt_last == 0) {
             slot.stats.update_prompt_last();
         }
@@ -1046,6 +1205,10 @@ struct strata_context_impl {
         if (d.finish == "nonfinite") {
             send_error(t, "the engine produced non-finite logits", ERROR_TYPE_SERVER);
             finish_slot();
+            return;
+        }
+        if (slot.pausing && slot.has_next_token && d.finish == "cancel") {
+            pause_slot();
             return;
         }
         if (slot.stop == STOP_TYPE_NONE) {
@@ -1066,15 +1229,48 @@ struct strata_context_impl {
         finish_slot();
     }
 
+    // a later turn of the running request reads `reread` tokens: one when the engine went on from the state it kept
+    // (live or parked). More: it kept neither (no room to park it: its RAM floor, --conversation-cache-mib / -slots),
+    // so the history is read again, and pausing costs more than it saves - the turns stop for a while.
+    void check_resumed(long long reread) {
+        if (reread <= 32) {
+            return;
+        }
+        SRV_WRN("task %d: turn %d reads %lld tokens again: the engine did not keep this conversation while it was paused "
+                "(free RAM below its floor, or more --conversation-cache-mib / --conversation-cache-slots needed); "
+                "requests in flight run one after another for %lld s\n", slot.task->id, slot.turns, reread,
+                (long long) TURNS_OFF_MS / 1000);
+        turns_off_until_ms = Engine::now_ms() + TURNS_OFF_MS;
+    }
+
     void finish_slot() {
+        pending_pin = -1;   // (an answer that pinned was saved before this; a cancelled or failed one is not)
         slot.release();
+        run_next();
         queue_tasks.pop_deferred_task(-1);
     }
 
+    // the running request gave the engine up mid-answer: to the back of the line, the next one starts
+    void pause_slot() {
+        if (pending_pin >= 0) {
+            // its system prompt's checkpoint is in the engine's session now, as after an answer; the next request
+            // would make it another conversation
+            save_prefix_after_request();
+        }
+        slot.started       = false;
+        slot.pausing       = false;
+        slot.slice_from_ms = 0;
+        ready.push_back(std::move(slot));
+        slot = Slot{};   // (not release(): the paused request keeps its pictures file)
+        run_next();
+    }
+
     // mirrors send_partial_response in server-context.cpp
-    void send_partial_response(const completion_token_output & tkn, bool is_progress, bool is_begin, long long pp_done = 0) {
+    void send_partial_response(Slot & slot, const completion_token_output & tkn, bool is_progress, bool is_begin,
+                               long long pp_done = 0) {
         auto res = std::make_unique<server_task_result_cmpl_partial>();
         const server_task & t = *slot.task;
+        slot.last_result_ms = Engine::now_ms();
 
         res->id    = t.id;
         res->index = t.index;
@@ -1347,16 +1543,24 @@ struct strata_context_impl {
         const bool stream = json_value(data, "stream", false);
 
         if (!stream) {
-            auto all_results = rd.wait_for_all(req.should_stop);
-            if (all_results.is_terminated) {
-                return res; // connection closed
-            } else if (all_results.error) {
-                res->error(all_results.error->to_json());
+            // rd.wait_for_all, but past the empty results wake_readers sends while the request is in flight
+            while (rd.has_next()) {
+                auto result = rd.next(req.should_stop);
+                if (result == nullptr) {
+                    return res; // connection closed
+                }
+                if (result->is_error()) {
+                    res->error(result->to_json());
+                    return res;
+                }
+                if (dynamic_cast<server_task_result_cmpl_final*>(result.get()) == nullptr) {
+                    if (req.should_stop()) {
+                        return res; // connection closed (the reader's destructor cancels the task)
+                    }
+                    continue;
+                }
+                res->ok(result->to_json());
                 return res;
-            } else {
-                GGML_ASSERT(all_results.results.size() == 1);
-                GGML_ASSERT(dynamic_cast<server_task_result_cmpl_final*>(all_results.results[0].get()) != nullptr);
-                res->ok(all_results.results[0]->to_json());
             }
             return res;
         }
@@ -1388,7 +1592,7 @@ struct strata_context_impl {
         }
         res->status       = 200;
         res->content_type = "text/event-stream";
-        res->set_next([res_this = res.get(), res_type, sse_ping_interval](std::string & output) -> bool {
+        res->set_next([res_this = res.get(), res_type, sse_ping_interval, last_write = ggml_time_ms()](std::string & output) mutable -> bool {
             static auto format_error = [](task_response_type res_type, const json & res_json) {
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     return format_anthropic_sse({{"event", "error"}, {"data", res_json}});
@@ -1435,6 +1639,7 @@ struct strata_context_impl {
                 if (timeout) {
                     // a client with an idle timeout (pi: 5 minutes) stays attached; a client that is gone fails this write
                     output = ":\n\n";
+                    last_write = ggml_time_ms();
                     return true;
                 }
                 if (result == nullptr) {
@@ -1450,6 +1655,16 @@ struct strata_context_impl {
                     dynamic_cast<server_task_result_cmpl_final*>(result.get()) != nullptr
                 );
                 json res_json = result->to_json();
+                if (res_json.is_null()) {
+                    // an empty result from wake_readers: nothing to write but a ping when one is due; the next call
+                    // checks the connection first
+                    output = sse_ping_interval > 0 && ggml_time_ms() - last_write > (int64_t) sse_ping_interval * 1000 ? ":\n\n" : "";
+                    if (!output.empty()) {
+                        last_write = ggml_time_ms();
+                    }
+                    return true;
+                }
+                last_write = ggml_time_ms();
                 if (res_type == TASK_RESPONSE_TYPE_ANTHROPIC) {
                     output = format_anthropic_sse(res_json);
                 } else if (res_type == TASK_RESPONSE_TYPE_OAI_RESP) {
@@ -1498,6 +1713,10 @@ void strata_context::set_prefix_file(const std::string & name) {
 
 void strata_context::set_system_tags_to_user(const std::vector<std::string> & tags) {
     impl->move_tags = tags;
+}
+
+void strata_context::set_slice_ms(long long ms) {
+    impl->slice_ms = ms < 0 ? 0 : ms;
 }
 
 bool strata_context::load(common_params & params, std::string & err) {
@@ -1625,6 +1844,39 @@ bool strata_context::load(common_params & params, std::string & err) {
         }
     }
 
+    // --parallel N: requests in flight at once, taking turns on the engine. A turn change is cheap only when the
+    // engine parks the conversation it leaves (--conversation-cache-mib); without that the paused one reads its
+    // history again on its next turn. Default (llama-server's -1, auto): as many as the engine parks, or 1.
+    {
+        long long park_mib = 0, park_slots = 4;
+        for (size_t i = 0; i + 1 < I.engine_args.size(); ++i) {
+            if (I.engine_args[i] == "--conversation-cache-mib")   park_mib   = std::atoll(I.engine_args[i + 1].c_str());
+            if (I.engine_args[i] == "--conversation-cache-slots") park_slots = std::atoll(I.engine_args[i + 1].c_str());
+        }
+        const bool parks = park_mib > 0 && park_slots > 0;
+        if (params.n_parallel < 0) {
+            I.max_inflight = parks ? (int) std::min<long long>(park_slots, 16) : 1;
+        } else {
+            I.max_inflight = std::max(1, params.n_parallel);
+            if (I.max_inflight > 1 && !parks) {
+                LOG_WRN("--parallel %d without --conversation-cache-mib in the engine's options: a request that waited "
+                        "for its turn reads its whole conversation again\n", I.max_inflight);
+            } else if (I.max_inflight > park_slots + 1) {
+                LOG_WRN("--parallel %d is more than the engine parks (--conversation-cache-slots %lld) plus the one it "
+                        "runs: some turns read their conversation again\n", I.max_inflight, park_slots);
+            }
+        }
+        if (I.max_inflight > 1 && !I.engine.can_stop()) {
+            LOG_WRN("%s", "the engine does not honour STOP: requests in flight run one after another, not in turns\n");
+        }
+        if (I.max_inflight > 1) {
+            LOG_INF("up to %d requests in flight; the engine runs one at a time, switching every %lld ms of decoding%s\n",
+                    I.max_inflight, (long long) I.slice_ms, I.slice_ms > 0 ? "" : " (never: --slice-ms 0)");
+        } else {
+            LOG_INF("%s", "one request at a time; more wait in the queue (--parallel N for several in flight)\n");
+        }
+    }
+
     I.queue_tasks.on_new_task([this](server_task && task, bool is_yielding) {
         return impl->process_new_task(std::move(task), is_yielding);
     });
@@ -1676,7 +1928,7 @@ void strata_context::init_routes(server_http_context & http) {
         }
         // llama.cpp's shape ("status") plus the fields upstream PolyStrata clients (tools/strata_bench.py,
         // its is_strata / wait_ready) look for: "service" and "loaded". The engine only serves once loaded.
-        res->ok({{"status", "ok"}, {"busy", I->slot.active()},
+        res->ok({{"status", "ok"}, {"busy", I->n_inflight.load() > 0}, {"requests", I->n_inflight.load()},
                  {"service", "strata"}, {"loaded", true},
                  {"model", I->model_name}, {"max_context", I->n_ctx}});
         return res;
@@ -1699,7 +1951,7 @@ void strata_context::init_routes(server_http_context & http) {
         }
         res->ok(json {
             {"default_generation_settings", {{"n_ctx", I->n_ctx}}},
-            {"total_slots", 1},
+            {"total_slots", I->max_inflight},
             {"model_path", I->model_path},
             {"model_alias", I->model_name},
             {"modalities", {{"vision", I->chat_params.allow_image}, {"audio", false}}},

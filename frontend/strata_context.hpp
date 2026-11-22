@@ -6,7 +6,8 @@
 // tokenization helpers and SSE formatting (server-common), the request schema (server-schema). What this file adds is
 // the part that llama.cpp does with llama_context, llama_batch and common_sampler and that the engine does inside
 // its own process: run one request at a time through `strata`/`strata-poly`, turn its `T <id>` lines into partial
-// results, and its `DONE` line into the final one.
+// results, and its `DONE` line into the final one. With --parallel N several requests are in flight and take turns
+// on the engine (strata_context.cpp, Slot).
 #pragma once
 
 #include "server-http.h"
@@ -42,6 +43,9 @@ struct strata_context {
     // message, so a system prompt that ends with per-session details (pi's <cwd>, opencode's <env>) is the same
     // prompt in every session and its cached checkpoint matches; before load()
     void set_system_tags_to_user(const std::vector<std::string> & tags);
+    // --slice-ms MS: with --parallel N (llama-server's -np) up to N requests are in flight and the engine runs them in
+    // turns: the running one is paused after MS of decoding when another waits (0: never paused); before load()
+    void set_slice_ms(long long ms);
 
     // Blocks the calling thread running the task loop until terminate().
     void start_loop();

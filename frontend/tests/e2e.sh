@@ -186,10 +186,155 @@ check $([ "$aw" = 404 ] && echo 0 || echo 1) "anthropic request for another mode
 am=$(curl -s "$TPL_URL/v1/messages" -H 'content-type: application/json' -d '{"model":"fake","max_tokens":8,"system":[{"type":"text","text":"You are Claude Code."},{"type":"text","text":"Be brief."}],"messages":[{"role":"user","content":[{"type":"text","text":"<system-reminder>x</system-reminder>"},{"type":"text","text":"hi"}]},{"role":"system","content":[{"type":"text","text":"# Environment\ncwd: /tmp"}]}],"thinking":{"type":"adaptive"},"output_config":{"effort":"low"}}')
 check $([ "$(echo "$am" | j 'd["type"]')" = message ] && echo 0 || echo 1) "anthropic system message mid-conversation: $(echo "$am" | j 'd.get("type") or d.get("error",{}).get("message","")[:80]')"
 
+# --parallel: several requests in flight take turns on the one engine (--slice-ms of decoding each), all streaming
+# meanwhile; a paused answer goes on from where it stopped (the fake engine's FAKE_RESUME continues a prompt that ends
+# with the start of its answer, as the real one continues its live or parked conversation). A fifth server: 3 in
+# flight, 150 ms turns, 5 ms per token.
+PAR_PORT=$((PORT + 3)); PAR_URL=http://127.0.0.1:$PAR_PORT; PAR_LOG=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-par-XXXXXX")
+PAR_GENS=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-pargen-XXXXXX")
+FAKE_N_TOKENS=100000 FAKE_TOKEN_ID=9707 FAKE_DELAY_MS=5 FAKE_RESUME=1 FAKE_LOG="$PAR_GENS" "$BIN" --engine "$HERE/fake-engine.py" -m "$MODEL" --host 127.0.0.1 --port "$PAR_PORT" --alias fake --parallel 3 --slice-ms 150 -- --max-context 4096 > "$PAR_LOG" 2>&1 &
+PAR_PID=$!
+trap 'kill $PID $SLOW_PID $TPL_PID $PAR_PID 2>/dev/null; wait $PID $SLOW_PID $TPL_PID $PAR_PID 2>/dev/null; rm -f "$LOG" "$SLOW_LOG" "$TPL_LOG" "$PAR_LOG" "$PAR_GENS" "$BIG"' EXIT
+for i in $(seq 1 100); do
+    if curl -s -o /dev/null -w '%{http_code}' "$PAR_URL/health" 2>/dev/null | grep -q 200; then break; fi
+    if ! kill -0 $PAR_PID 2>/dev/null; then echo "FAIL parallel server exited early"; cat "$PAR_LOG"; exit 1; fi
+    sleep 0.2
+done
+check $([ "$(curl -s "$PAR_URL/props" | j 'd["total_slots"]')" = 3 ] && echo 0 || echo 1) "parallel: /props total_slots 3"
+par=$(python3 - "$PAR_URL" <<'PY'
+import json, sys, threading, time, urllib.request
+url = sys.argv[1] + "/v1/chat/completions"
+def body(text, n, stream):
+    return json.dumps({"model": "fake", "stream": stream, "max_tokens": n,
+                       "messages": [{"role": "user", "content": text}]}).encode()
+def run(i, n, out, stream=True, close_after=0):
+    r = urllib.request.urlopen(urllib.request.Request(url, data=body("chat %d" % i, n, stream),
+                                                      headers={"content-type": "application/json"}), timeout=60)
+    t0 = time.time(); first = None; text = ""; usage = None; finish = None; chunks = 0
+    if not stream:
+        d = json.load(r)
+        out[i] = {"first": time.time() - t0, "end": time.time() - t0, "text": d["choices"][0]["message"]["content"],
+                  "usage": d["usage"]["completion_tokens"], "finish": d["choices"][0]["finish_reason"], "t0": t0}
+        return
+    for line in r:
+        line = line.decode().strip()
+        if not line.startswith("data: {"):
+            continue
+        d = json.loads(line[6:])
+        if d.get("usage"):
+            usage = d["usage"]["completion_tokens"]
+        for c in d.get("choices", []):
+            delta = c["delta"].get("content") or ""
+            if delta and first is None:
+                first = time.time()
+            text += delta
+            chunks += 1 if delta else 0
+            finish = c.get("finish_reason") or finish
+        if close_after and chunks >= close_after:
+            r.close(); out[i] = {"closed": True}; return
+    out[i] = {"first": first, "end": time.time(), "text": text, "usage": usage, "finish": finish, "t0": t0}
+fail = []
+def report(ok, what):
+    print(("ok   " if ok else "FAIL ") + what)
+    if not ok: fail.append(what)
+# three streams at once: each whole and in order, and all of them streaming before any ends
+out = {}
+ts = [threading.Thread(target=run, args=(i, 120, out)) for i in range(3)]
+for t in ts: t.start()
+for t in ts: t.join()
+whole = all(out[i]["text"] == "Hello" * 120 and out[i]["usage"] == 120 and out[i]["finish"] == "length" for i in range(3))
+report(whole, "3 streams at once: each 120 tokens, whole (%s)" % [(len(out[i]["text"]) // 5, out[i]["usage"], out[i]["finish"]) for i in range(3)])
+first_last = max(out[i]["first"] for i in range(3)); end_first = min(out[i]["end"] for i in range(3))
+report(first_last < end_first, "3 streams at once: every one streamed before the first ended (last first token %.2f s before the first end)" % (end_first - first_last))
+# four at once with --parallel 3: the fourth waits in the queue, and is answered (non-streaming here)
+out = {}
+ts = [threading.Thread(target=run, args=(i, 60, out, i % 2 == 0)) for i in range(4)]
+for t in ts: t.start(); time.sleep(0.02)
+for t in ts: t.join()
+report(all(out[i]["text"] == "Hello" * 60 and out[i]["usage"] == 60 for i in range(4)), "4 requests with --parallel 3: all answered whole")
+# a client that leaves while the requests take turns: the others go on, whole
+out = {}
+ts = [threading.Thread(target=run, args=(0, 150, out)), threading.Thread(target=run, args=(1, 2000, out, True, 20)),
+      threading.Thread(target=run, args=(2, 150, out))]
+for t in ts: t.start(); time.sleep(0.02)
+for t in ts: t.join()
+report(out[1].get("closed") and all(out[i]["text"] == "Hello" * 150 for i in (0, 2)), "a client that leaves mid-turn: the other two whole")
+sys.exit(1 if fail else 0)
+PY
+); rc=$?
+echo "$par" | sed 's/^/     /'
+check $rc "parallel requests take turns"
+check $(grep -q "paused after" "$PAR_LOG" && grep -q "resumed (turn" "$PAR_LOG" && echo 0 || echo 1) "parallel: server logged pauses and resumes"
+check $(awk '$4 > 0' "$PAR_GENS" | grep -q . && echo 0 || echo 1) "parallel: a later turn continued the answer ($(awk '$4 > 0' "$PAR_GENS" | wc -l) continuing GENs of $(wc -l < "$PAR_GENS"))"
+check $(! grep -q "read .* tokens again\|prompt size mismatch" "$PAR_LOG" && echo 0 || echo 1) "parallel: no turn read its conversation again, no size mismatch"
+# a request waiting for its turn while another streams: its stream gets SSE pings, and a client that leaves is seen
+# while it waits (llama.cpp's reader would not time out while other results arrive; the front end wakes it). Its own
+# server: long turns, a ping every second.
+WAIT_PORT=$((PORT + 4)); WAIT_LOG=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-wait-XXXXXX")
+FAKE_N_TOKENS=100000 FAKE_TOKEN_ID=9707 FAKE_DELAY_MS=5 FAKE_RESUME=1 "$BIN" --engine "$HERE/fake-engine.py" -m "$MODEL" --host 127.0.0.1 --port "$WAIT_PORT" --alias fake --parallel 3 --slice-ms 5000 --sse-ping-interval 1 -- --max-context 4096 > "$WAIT_LOG" 2>&1 &
+WAIT_PID=$!
+trap 'kill $PID $SLOW_PID $TPL_PID $PAR_PID $WAIT_PID 2>/dev/null; wait $PID $SLOW_PID $TPL_PID $PAR_PID $WAIT_PID 2>/dev/null; rm -f "$LOG" "$SLOW_LOG" "$TPL_LOG" "$PAR_LOG" "$PAR_GENS" "$WAIT_LOG" "$BIG"' EXIT
+for i in $(seq 1 100); do
+    if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WAIT_PORT/health" 2>/dev/null | grep -q 200; then break; fi
+    if ! kill -0 $WAIT_PID 2>/dev/null; then echo "FAIL waiting server exited early"; cat "$WAIT_LOG"; exit 1; fi
+    sleep 0.2
+done
+curl -s -N "http://127.0.0.1:$WAIT_PORT/v1/chat/completions" -H 'content-type: application/json' -d '{"model":"fake","stream":true,"max_tokens":1200,"messages":[{"role":"user","content":"a"}]}' > /dev/null &
+RUN_CURL=$!
+sleep 0.2
+pings=$(python3 - "$WAIT_PORT" <<'PY'
+import json, socket, sys, time
+port = int(sys.argv[1])
+def open_req(stream):
+    b = json.dumps({"model": "fake", "stream": stream, "max_tokens": 2000, "messages": [{"role": "user", "content": "b"}]})
+    s = socket.create_connection(("127.0.0.1", port))
+    s.sendall(("POST /v1/chat/completions HTTP/1.1\r\nHost: x\r\nContent-Type: application/json\r\nContent-Length: %d\r\n\r\n%s" % (len(b), b)).encode())
+    return s
+s = open_req(True)
+s.settimeout(0.2)
+got, t0 = b"", time.time()
+while time.time() - t0 < 2.6:
+    try:
+        got += s.recv(4096)
+    except socket.timeout:
+        pass
+s.close()
+open_req(False).close()
+print(got.count(b"\r\n:\n\n"))   # a ping is a chunk of its own: ":\n\n" right after its size line
+PY
+)
+sleep 1.5
+check $([ "${pings:-0}" -ge 1 ] && echo 0 || echo 1) "parallel: a stream waiting for its turn gets SSE pings ($pings in 2.6 s)"
+check $([ "$(grep -c "cancelled by the client while waiting" "$WAIT_LOG")" = 2 ] && [ "$(curl -s "http://127.0.0.1:$WAIT_PORT/health" | j 'd["requests"]')" = 1 ] && echo 0 || echo 1) "parallel: clients that leave while waiting (stream, non-stream) are cancelled before their turn"
+wait $RUN_CURL
+
+# an engine that could not park a paused answer (FAKE_FORGET: the turn reads it again): the turns stop, and the
+# requests in flight run one after another, whole
+FORGET_PORT=$((PORT + 5)); FORGET_LOG=$(mktemp "${TMPDIR:-/tmp}/us2-e2e-forget-XXXXXX")
+FAKE_N_TOKENS=100000 FAKE_TOKEN_ID=9707 FAKE_DELAY_MS=5 FAKE_RESUME=1 FAKE_FORGET=1 "$BIN" --engine "$HERE/fake-engine.py" -m "$MODEL" --host 127.0.0.1 --port "$FORGET_PORT" --alias fake --parallel 2 --slice-ms 150 -- --max-context 4096 > "$FORGET_LOG" 2>&1 &
+FORGET_PID=$!
+trap 'kill $PID $SLOW_PID $TPL_PID $PAR_PID $WAIT_PID $FORGET_PID 2>/dev/null; wait $PID $SLOW_PID $TPL_PID $PAR_PID $WAIT_PID $FORGET_PID 2>/dev/null; rm -f "$LOG" "$SLOW_LOG" "$TPL_LOG" "$PAR_LOG" "$PAR_GENS" "$WAIT_LOG" "$FORGET_LOG" "$BIG"' EXIT
+for i in $(seq 1 100); do
+    if curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$FORGET_PORT/health" 2>/dev/null | grep -q 200; then break; fi
+    if ! kill -0 $FORGET_PID 2>/dev/null; then echo "FAIL forget server exited early"; cat "$FORGET_LOG"; exit 1; fi
+    sleep 0.2
+done
+for k in 1 2; do
+    curl -s "http://127.0.0.1:$FORGET_PORT/v1/chat/completions" -H 'content-type: application/json' -d "{\"model\":\"fake\",\"max_tokens\":200,\"messages\":[{\"role\":\"user\",\"content\":\"c$k\"}]}" > "$FORGET_LOG.$k" &
+    sleep 0.05
+done
+wait %?FORGET_PORT 2>/dev/null; sleep 0.2
+while [ "$(curl -s "http://127.0.0.1:$FORGET_PORT/health" | j 'd["requests"]')" != 0 ]; do sleep 0.2; done
+fw=$(for k in 1 2; do j 'd["usage"]["completion_tokens"]' < "$FORGET_LOG.$k"; done | paste -sd,); rm -f "$FORGET_LOG.1" "$FORGET_LOG.2"
+check $([ "$fw" = "200,200" ] && [ "$(grep -c "paused after" "$FORGET_LOG")" = 2 ] && grep -q "run one after another" "$FORGET_LOG" && echo 0 || echo 1) "parallel: an engine that cannot park stops the turns ($(grep -c "paused after" "$FORGET_LOG") pauses, answers $fw tokens)"
+
+pr=$(curl -s "$PAR_URL/v1/chat/completions" -H 'content-type: application/json' -d '{"model":"fake","messages":[{"role":"user","content":"after"}],"max_tokens":8}')
+check $([ "$(echo "$pr" | j 'd["usage"]["completion_tokens"]')" = 8 ] && [ "$(curl -s "$PAR_URL/health" | j 'd["requests"]')" = 0 ] && echo 0 || echo 1) "parallel: a request afterwards is clean, none left in flight"
+
 # tokenize / detokenize round trip
 t=$(curl -s "$URL/tokenize" -H 'content-type: application/json' -d '{"content":"Hello, world!"}' | j 'd["tokens"]')
 d=$(curl -s "$URL/detokenize" -H 'content-type: application/json' -d "{\"tokens\":$t}" | j 'd["content"]')
 check $([ "$d" = "Hello, world!" ] && echo 0 || echo 1) "tokenize/detokenize round trip: $t"
 
-if [ $fail = 0 ]; then echo "e2e: all checks passed"; else echo "--- server log"; tail -40 "$LOG"; echo "--- slow server log"; tail -20 "$SLOW_LOG"; echo "--- template server log"; tail -20 "$TPL_LOG"; fi
+if [ $fail = 0 ]; then echo "e2e: all checks passed"; else echo "--- server log"; tail -40 "$LOG"; echo "--- slow server log"; tail -20 "$SLOW_LOG"; echo "--- template server log"; tail -20 "$TPL_LOG"; echo "--- parallel server log"; tail -30 "$PAR_LOG"; fi
 exit $fail

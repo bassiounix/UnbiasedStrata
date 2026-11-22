@@ -648,11 +648,34 @@ indexer keys and the K/V beyond 20,480 cells are read over PCIe (13.2 tok/s at 2
 
 ## Several requests, and caching across conversations and restarts
 
-**Several requests at once** are accepted and wait in a queue: the engine answers one, then the next. The engine can
-also decode several conversations together (`--batch N`, [docs/BATCHING.md](../docs/BATCHING.md)), but not here:
-each batch slot needs its own session in VRAM (0.56 GiB at a 32K window in the upstream measurement; this card has
-~0.2 GiB free), `STRATA_PREFILL_IN_HEAD` excludes it, and this front end drives one slot. Where most experts live in
-RAM, as here, upstream measured slots as waiting time, not speed: 11-24% slower per request on a 12 GB card.
+**Several requests at once** (parallel agents, sub-agents, several chats): up to `PARALLEL` requests are in flight
+(default `PARK_SLOTS`, 4) and all of them stream. The engine still runs one at a time, so they take turns: when another
+request waits, the running one gives the engine up after `SLICE_MS` (default 8000) of decoding. The engine keeps its
+conversation exactly at the tokens it sent and parks it in RAM when the next request is another conversation
+(`PARK_MIB`, `PARK_SLOTS`); its next turn sends the prompt plus its answer so far, and the engine restores the parked
+state and reads one token, so nothing is read again. More than `PARALLEL` requests wait in the queue, as before.
+
+- What it costs: a turn change parks one conversation and restores another. Measured 2026-11-22 (three chats at once,
+  300 tokens each, `CONTEXT=131072`): parked in 0.17-0.22 s, restored in 0.12 s, nothing read again, so ~4% of
+  decode time with 8 s turns. The total speed stays the engine's; with four answers at once each gets about a quarter,
+  and none waits for the others to finish. The answers read on across the pauses as one text.
+- A new request reads its prompt in its own turn, uninterrupted (a cold 25K-token prompt ~53 s, an agent turn ~8 s);
+  the others wait meanwhile. A paused answer resumes only after the requests ahead of it have had their turn.
+- **Parking needs free RAM.** The engine parks only while more than 2.5 GiB of RAM stays free, and on this box the
+  page-locked experts (40 GiB), the K/V and the rest leave little: at the 262K default with ~8 GB used by other
+  programs, it had 2.4-2.7 GB free and refused to park, and each resumed turn read its conversation again (on the same
+  day at 128K it parked every time). The front end notices (`turn N reads ... tokens again ... run one after another
+  for 300 s`) and stops the turns for 5 minutes: the requests in flight then run one after another, as before, with
+  their streams open. For parallel agents, run `CONTEXT=131072` (1 GiB less pinned K/V) or close memory-heavy
+  programs. A parked conversation takes ~0.23 GB plus ~17 KB per token (measured: 248 MB at 1.4K tokens, 458 MB at
+  26K); keep `PARALLEL` at most `PARK_SLOTS` and `PARK_MIB` large enough for them (four 50K-token agents: ~4.4 GB).
+- `SLICE_MS=0` keeps every request in flight (headers and pings sent at once) but runs them one after another;
+  `PARALLEL=1` is the old queue.
+- The engine's own batch slots (`--batch N`, [docs/BATCHING.md](../docs/BATCHING.md)) would decode several conversations
+  in the same pass, but not here: each slot needs its own session in VRAM (0.56 GiB at a 32K window in the upstream
+  measurement; this card has ~0.2 GiB free), `STRATA_PREFILL_IN_HEAD` (the 4096-token chunks) excludes it, and session
+  files refuse it. Where most experts live in RAM, as here, upstream measured slots as waiting time, not speed: 11-24%
+  slower per request on a 12 GB card.
 
 **Caching** (all on by default in `strata-agent`, measured 2026-11-08 at 262K with a 25K-token pi-like system prompt):
 

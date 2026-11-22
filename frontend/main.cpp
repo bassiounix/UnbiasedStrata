@@ -67,6 +67,13 @@ void usage() {
         "  --system-tags-to-user a,b  <a>...</a> blocks of the system message move to the start of the first user\n"
         "                         message (pi's <cwd>, opencode's <env>): the system prompt is then the same in every\n"
         "                         folder and its cached checkpoint matches\n"
+        "  -np, --parallel N      (llama-server's) up to N requests in flight at once, for parallel agents and chats:\n"
+        "                         the engine still runs one, so they take turns and all stream meanwhile; a paused\n"
+        "                         answer resumes from the engine's parked conversation without reading it again.\n"
+        "                         Default: the engine's --conversation-cache-slots when it parks (--conversation-\n"
+        "                         cache-mib), else 1 (one at a time, the others queued)\n"
+        "  --slice-ms MS          with --parallel: the running request gives the engine up after MS of decoding when\n"
+        "                         another waits (default 8000; 0: never, they run one after another)\n"
         "  --                     everything after it is passed to the engine; --serve is added\n"
         "\n"
         "example (Qwen3.6-35B-A3B from its GGUF):\n"
@@ -104,6 +111,7 @@ int main(int argc, char ** argv) {
     std::vector<char *> llama_argv;
     bool mmproj_gpu = false; // the vision encoder on the card: only where the engine leaves room (a 48 GB card)
     long picture_cache = 64; // --picture-cache N: encoded pictures kept for the turns that resend them
+    long long slice_ms = 8000; // --slice-ms MS: with --parallel, a turn's decoding time before another request's turn
     std::string prefix_file;               // --prefix-file NAME: the system prompt kept on disk (needs --slot-save-path)
     std::vector<std::string> system_tags;  // --system-tags-to-user a,b
     llama_argv.push_back(argv[0]);
@@ -155,6 +163,13 @@ int main(int argc, char ** argv) {
             if (picture_cache < 0) { usage(); return 2; }
             continue;
         }
+        if (a == "--slice-ms") {
+            if (i + 1 >= argc) { usage(); return 2; }
+            char * end = nullptr;
+            slice_ms = std::strtoll(argv[++i], &end, 10);
+            if (end == argv[i] || *end != '\0' || slice_ms < 0) { usage(); return 2; }
+            continue;
+        }
         llama_argv.push_back(argv[i]);
     }
     if (engine_exe.empty()) {
@@ -198,6 +213,7 @@ int main(int argc, char ** argv) {
     ctx_server.set_picture_cache((size_t) picture_cache, (size_t) 1 << 30);
     ctx_server.set_prefix_file(prefix_file);
     ctx_server.set_system_tags_to_user(system_tags);
+    ctx_server.set_slice_ms(slice_ms);
     server_http_context ctx_http;
     if (!ctx_http.init(params)) {
         SRV_ERR("%s", "failed to initialize HTTP server\n");

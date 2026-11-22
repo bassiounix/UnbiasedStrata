@@ -20,8 +20,12 @@
 # off the bus (NVRM Xid 79, a reboot to recover).  AUTO_RETRAIN=1 lets it retrain by itself through the root helper
 # gpu-link-retrain - at startup, and while serving at most once every 5 minutes.
 #
-# Several requests: they queue and are answered one after another (a parallel batch slot needs ~0.5 GiB of VRAM per
-# conversation; this card has ~0.2 GiB free).  Caching across conversations and restarts:
+# Several requests at once (parallel agents, several chats): up to PARALLEL are in flight and all stream; the engine
+# runs one at a time, so they take turns of SLICE_MS of decoding (8000).  A paused answer is parked in RAM by the engine
+# (PARK_*) and goes on from where it stopped, nothing read again; a new request reads its prompt in its turn.  PARALLEL
+# defaults to PARK_SLOTS (4); more than that would push conversations out of the parking.  (The engine's own batch
+# slots, which decode several at once, need ~0.5 GiB of VRAM per conversation and no STRATA_PREFILL_IN_HEAD; this
+# card has ~0.2 GiB free.)  Caching across conversations and restarts:
 #   - a new chat with the same system prompt starts after it (the engine's checkpoints, always on);
 #   PARK_MIB=6144 PARK_SLOTS=4: up to 4 conversations parked in RAM (~30 KB per token: ~1 GB for a 32K-token chat),
 #     so switching between chats (an agent and its sub-agents, two terminals) does not read their history again;
@@ -34,7 +38,8 @@
 # Settings: ~/.config/strata-agent.conf (written by install.sh); any of them can be overridden from the environment:
 #   REPO=~/dev/UnbiasedStrata  MODEL_DIR=~/dev/models/swift-iq3_xxs  HOST=127.0.0.1  PORT=18090
 #   CONTEXT=262144  CHUNK=4096  PIN_EXPERTS=1  VISION=1  VISION_THREADS=12  HOLD_LINK=1  WATCH_LINK=1  AUTO_RETRAIN=0
-#   PARK_MIB=6144  PARK_SLOTS=4  PREFIX_CACHE=1  MOVE_TAGS=cwd,env  SESSION_DIR=~/.cache/strata-agent/sessions
+#   PARK_MIB=6144  PARK_SLOTS=4  PARALLEL=(PARK_SLOTS)  SLICE_MS=8000  PREFIX_CACHE=1  MOVE_TAGS=cwd,env
+#   SESSION_DIR=~/.cache/strata-agent/sessions
 # Extra arguments go to the engine (after the front end's `--`).
 set -uo pipefail
 
@@ -44,6 +49,7 @@ _env_CHUNK=${CHUNK-}; _env_VISION=${VISION-}; _env_VISION_THREADS=${VISION_THREA
 _env_WATCH_LINK=${WATCH_LINK-}; _env_AUTO_RETRAIN=${AUTO_RETRAIN-}; _env_PIN_EXPERTS=${PIN_EXPERTS-}
 _env_HOLD_LINK=${HOLD_LINK-}; _env_PARK_MIB=${PARK_MIB-}; _env_PARK_SLOTS=${PARK_SLOTS-}
 _env_PREFIX_CACHE=${PREFIX_CACHE-}; _env_SESSION_DIR=${SESSION_DIR-}
+_env_PARALLEL=${PARALLEL-}; _env_SLICE_MS=${SLICE_MS-}
 _env_MOVE_TAGS=${MOVE_TAGS-}; _env_MOVE_TAGS_set=${MOVE_TAGS+1}   # MOVE_TAGS= (empty) turns it off
 # shellcheck disable=SC1090
 [[ -r $CONF ]] && source "$CONF"
@@ -62,6 +68,8 @@ HOLD_LINK=${_env_HOLD_LINK:-${HOLD_LINK:-1}}
 PARK_MIB=${_env_PARK_MIB:-${PARK_MIB:-6144}}
 PARK_SLOTS=${_env_PARK_SLOTS:-${PARK_SLOTS:-4}}
 PREFIX_CACHE=${_env_PREFIX_CACHE:-${PREFIX_CACHE:-1}}
+PARALLEL=${_env_PARALLEL:-${PARALLEL:-}}
+SLICE_MS=${_env_SLICE_MS:-${SLICE_MS:-8000}}
 if [[ -n $_env_MOVE_TAGS_set ]]; then MOVE_TAGS=$_env_MOVE_TAGS; else MOVE_TAGS=${MOVE_TAGS-cwd,env}; fi
 SESSION_DIR=${_env_SESSION_DIR:-${SESSION_DIR:-$HOME/.cache/strata-agent/sessions}}
 HELPER=/usr/local/sbin/gpu-link-retrain
@@ -162,6 +170,9 @@ if [[ -n $SESSION_DIR ]] && mkdir -p -m 700 "$SESSION_DIR"; then
 fi
 [[ -n $MOVE_TAGS ]] && FRONT+=(--system-tags-to-user "$MOVE_TAGS")
 (( PARK_MIB > 0 )) && ENGINE+=(--conversation-cache-mib "$PARK_MIB" --conversation-cache-slots "$PARK_SLOTS")
+# requests in flight at once, taking turns (empty: the front end's default, PARK_SLOTS, or 1 without parking)
+[[ -n $PARALLEL ]] && FRONT+=(--parallel "$PARALLEL")
+FRONT+=(--slice-ms "$SLICE_MS")
 if [[ $VISION == 1 && -n $MMPROJ ]]; then
     FRONT+=(--mmproj "$MMPROJ" --threads "$VISION_THREADS")   # encoded on the CPU (the card has no room for it)
     ENGINE+=(--vision)
