@@ -198,9 +198,15 @@ cd "$REPO" || exit 1
 #   --short-read 0              required by STRATA_PREFILL_IN_HEAD
 #   --kv q4_0 --kv-resident 20480   4-bit K/V streamed from pinned RAM, 20480 cells per layer in VRAM (the minimum)
 #   --resident-experts          the experts the GPU does not hold kept in RAM (needs ~44 GiB available at start)
+#   STRATA_LOOKAHEAD=0          no routing-aware prefetch thread: it predicts the next layer's experts to warm their
+#                               pages, but here every expert is already in RAM, so it warmed nothing and kept a
+#                               hardware thread 56% busy during decode.  The CPU package is held to 45 W by the
+#                               laptop (README: What limits decode speed), so that power is the expert pool's (the
+#                               CPU's part of a token 26.1 -> 25.6 ms).  STRATA_LOOKAHEAD=1 in the environment keeps it
 export CUDA_MODULE_LOADING=LAZY STRATA_HC_REQ8=1 \
        STRATA_IDX_HOST=1 STRATA_PREFILL_IN_HEAD=1 STRATA_PREFILL_IN_DENSE=1 \
        STRATA_PF_GEMM_SCRATCH_MIB=16 STRATA_PF_GEMM_WS_MIB=4
+export STRATA_LOOKAHEAD=${STRATA_LOOKAHEAD-0}
 if [[ $PIN_EXPERTS == 1 ]]; then unset STRATA_RESIDENT_PIN; else export STRATA_RESIDENT_PIN=0; fi
 
 build/bin/unbiased-strata --engine build/bin/strata -m "$SH1" \

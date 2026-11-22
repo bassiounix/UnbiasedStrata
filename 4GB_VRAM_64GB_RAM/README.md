@@ -34,13 +34,14 @@ fraction of its speed.
 8. [Step 6 - run](#step-6---run)
 9. [Step 7 - benchmark](#step-7---benchmark)
 10. [The PCIe link problem](#the-pcie-link-problem)
-11. [How the configuration was found](#how-the-configuration-was-found)
-12. [Engine changes in this fork](#engine-changes-in-this-fork)
-13. [Context size: 262K (default) and 128K](#context-size-262k-default-and-128k)
-14. [Several requests, and caching across conversations and restarts](#several-requests-and-caching-across-conversations-and-restarts)
-15. [Troubleshooting](#troubleshooting)
-16. [Undo everything](#undo-everything)
-17. [Files in this folder](#files-in-this-folder)
+11. [What limits decode speed](#what-limits-decode-speed)
+12. [How the configuration was found](#how-the-configuration-was-found)
+13. [Engine changes in this fork](#engine-changes-in-this-fork)
+14. [Context size: 262K (default) and 128K](#context-size-262k-default-and-128k)
+15. [Several requests, and caching across conversations and restarts](#several-requests-and-caching-across-conversations-and-restarts)
+16. [Troubleshooting](#troubleshooting)
+17. [Undo everything](#undo-everything)
+18. [Files in this folder](#files-in-this-folder)
 
 ## The machine
 
@@ -448,6 +449,49 @@ is held, a reboot is the safer way out.
   `WATCH_LINK=0` turns this off.
 - **`AUTO_RETRAIN=1`** (needs `install.sh --system`) lets it retrain by itself: at start (then it waits 5 s and
   measures again), and while serving at most once every 5 minutes. Off by default because of the crashes above.
+
+## What limits decode speed
+
+Decode runs at 17.5-18 tok/s here (about 57 ms a token) and cannot go much above that on this laptop. Measured
+2026-11-22 at 262K context, greedy 400-token answers, the link at Gen 1 (stuck that day), `STRATA_DECODE_TIMING=1`:
+
+| Part of a token | Time | What bounds it |
+|---|---:|---|
+| The GPU's own work: 48 layers of attention / GDN, hyper-connections, router, shared expert, the output head | 27.7 ms | more than 2 GB of weights read per token on a 60 W card; `STRATA_VERIFY_PROFILE=1` names the stages (hyper-connection reads 7.3 ms, the projection GEMVs 5.3, copying and combining the CPU's rows 5.3 on the slow link) |
+| The CPU's experts: 7 per layer, 336 a token, ~590 MB of 2- to 4-bit weights | 24.5-26 ms | the CPU package's power: 45 W |
+
+The two alternate layer by layer (a layer's router decides its experts, the next layer needs their output), so the
+times add. Even with experts that cost nothing the GPU's part alone allows 36 tok/s.
+
+**The CPU is held to 45 W by the laptop, not by the engine or by Linux.** While it decodes, the P-cores run at 2.6 GHz
+(of 4.6) and the E-cores at 2.3 (of 3.5), with the package at 85 C. Read as root while a 14-thread load ran
+(`MSR_CORE_PERF_LIMIT_REASONS`, the RAPL energy counter):
+
+- the package draws 44.8 W and the limit reason is `PL1` in 47 of 50 samples; thermal throttling (97 C) only in the
+  first two seconds, when it draws 70-85 W;
+- raising PL1 to 65 W and to 90 W (`/sys/class/powercap/intel-rapl:0` and `intel-rapl-mmio:0`; the MSR showed the new
+  value) changed nothing: 44.8 W still. Something below the OS enforces 45 W, most likely the embedded controller;
+- fans at full speed (`pwm1_enable` 0: 2,000 -> 4,500 rpm) changed nothing either (73 C at 45 W is not the limit);
+- the `performance` power profile keeps the 45 W (44.5 W measured) and is slower: it asks every core for its top
+  clock all the time, and the limit then holds the package to 45 W by clamping instead (the same burst of work took
+  937 us against 679 at full load, 1,141 against 584 in the decode rhythm). Stay on `balanced`;
+- hyperthreads (`--pool-affinity auto --pool-workers 19`) do not help: the CPU's part 26.4 ms against 25.6-26.
+
+So the expert pool computes as fast as 45 W allow. What was tried on the waiting side: the workers spin while the GPU
+works; a WAITPKG wait (`STRATA_POOL_UMWAIT`, which upstream builds on Windows only) ported to Linux gave 3% faster bursts
+in a synthetic test and nothing measurable in the engine, so it was not kept. `STRATA_LOOKAHEAD=0` (set by
+`strata-agent`) stops a prefetch thread that had nothing to prefetch and was 56% busy: the CPU's part 26.1 -> 25.6 ms,
+which in tok/s is within the spread between runs.
+
+**Fewer experts per layer** is the one switch that buys speed, at the answers' expense: the engine already skips the
+three lowest-weighted of a token's ten experts when they are not in VRAM (`STRATA_ROUTE_TAIL_SKIP=7`, upstream's
+default; upstream measured a mean KL of 0.006 and 97.7% top-token agreement on a card that holds part of the experts -
+here none are held, so the skip applies to every layer). One more (`=6`): 18.1-18.5 tok/s. Two more (`=5`): 19.4-19.8.
+Not measured here: what that does to the answers.
+
+What would change it: a machine whose CPU may draw more than 45 W, or a card with room for the experts. Not measured
+here: a healthy PCIe link, which lets the GPU compute part of the experts (`pcie_frac`; at Gen 1 it computes none)
+and shortens the copy of the CPU's rows.
 
 ## How the configuration was found
 
